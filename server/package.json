@@ -1,0 +1,28 @@
+{
+  "name": "sexpr-scope-server",
+  "version": "0.1.0",
+  "description": "SexprScope language server: safe, non-evaluating static language intelligence for Common Lisp.",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "out/src/lsp/server.js",
+  "bin": {
+    "sexpr-scope-server": "out/src/lsp/cli.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p ./tsconfig.json",
+    "watch": "tsc -w -p ./tsconfig.json",
+    "test": "npm run build && node --test \"out/test/**/*.test.js\"",
+    "clean": "rimraf out"
+  },
+  "dependencies": {
+    "vscode-languageserver": "^9.0.1",
+    "vscode-languageserver-textdocument": "^1.0.12"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.6.3"
+  }
+}
