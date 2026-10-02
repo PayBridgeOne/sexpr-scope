@@ -16,30 +16,22 @@ import {
 } from "vscode-languageserver";
 import { TextDocument } from "vscode-languageserver-textdocument";
 import { URI } from "vscode-languageserver";
-import { promises as fs } from "fs";
-import * as path from "path";
 import { WorkspaceIndex } from "../indexer/workspace-index";
 import { atomAtOffset, referenceNamespaceAt } from "../parser/reader";
 import type { Document } from "../parser/reader";
 import { Namespace, parseQualifiedName } from "../model/symbol";
+import {
+  isSourceUri,
+  reindexUriFromDisk,
+  scanRoots,
+  uriToFsPath,
+} from "./workspace-fs";
 import {
   hoverMarkdown,
   kindLabel,
   toLspRange,
   toLspSymbolKind,
 } from "./conversions";
-
-/** File extensions SexprScope reads statically (never evaluates). */
-const SOURCE_EXTENSIONS = new Set([".lisp", ".cl", ".lsp", ".asd"]);
-
-/** Directories never worth scanning for Lisp source. */
-const IGNORED_DIRECTORIES = new Set([
-  ".git",
-  "node_modules",
-  "dist",
-  "out",
-  "build",
-]);
 
 /**
  * Wires the static language intelligence to an LSP connection.
@@ -68,16 +60,8 @@ export function createServer(connection: Connection): void {
     void reindexFromDisk(e.document.uri);
   });
 
-  const reindexFromDisk = async (uri: string): Promise<void> => {
-    const fsPath = uriToFsPath(uri);
-    if (!fsPath) return;
-    try {
-      const text = await fs.readFile(fsPath, "utf8");
-      index.setDocument(uri, text);
-    } catch {
-      index.removeDocument(uri);
-    }
-  };
+  const reindexFromDisk = (uri: string): Promise<void> =>
+    reindexUriFromDisk(uri, index);
 
   connection.onInitialize((params: InitializeParams): InitializeResult => {
     void scanWorkspace(index, params, openDocuments).catch(() => undefined);
@@ -191,9 +175,7 @@ async function scanWorkspace(
   openDocuments: ReadonlySet<string>,
 ): Promise<void> {
   const roots = workspaceRoots(params);
-  for (const root of roots) {
-    await scanDirectory(root, index, openDocuments);
-  }
+  await scanRoots(roots, index, (uri) => openDocuments.has(uri));
 }
 
 function workspaceRoots(params: InitializeParams): string[] {
@@ -209,64 +191,6 @@ function workspaceRoots(params: InitializeParams): string[] {
   }
   if (params.rootPath) return [params.rootPath];
   return [];
-}
-
-async function scanDirectory(
-  dir: string,
-  index: WorkspaceIndex,
-  openDocuments: ReadonlySet<string>,
-): Promise<void> {
-  let entries: import("fs").Dirent[];
-  try {
-    entries = await fs.readdir(dir, { withFileTypes: true });
-  } catch {
-    return;
-  }
-  for (const entry of entries) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      if (IGNORED_DIRECTORIES.has(entry.name)) continue;
-      await scanDirectory(full, index, openDocuments);
-    } else if (entry.isFile() && isSourcePath(entry.name)) {
-      const uri = fsPathToUri(full);
-      if (openDocuments.has(uri) || index.hasDocument(uri)) continue;
-      try {
-        const text = await fs.readFile(full, "utf8");
-        index.setDocument(uri, text);
-      } catch {
-        // Unreadable file: skip silently, stay tolerant.
-      }
-    }
-  }
-}
-
-function isSourcePath(name: string): boolean {
-  return SOURCE_EXTENSIONS.has(path.extname(name).toLowerCase());
-}
-
-function isSourceUri(uri: string): boolean {
-  const fsPath = uriToFsPath(uri);
-  return fsPath ? isSourcePath(fsPath) : false;
-}
-
-function uriToFsPath(uri: string): string | undefined {
-  try {
-    const u = new URL(uri);
-    if (u.protocol !== "file:") return undefined;
-    return decodeURIComponent(u.pathname);
-  } catch {
-    return undefined;
-  }
-}
-
-function fsPathToUri(fsPath: string): string {
-  const resolved = path.resolve(fsPath);
-  const encoded = resolved
-    .split(path.sep)
-    .map((segment) => encodeURIComponent(segment))
-    .join("/");
-  const leading = encoded.startsWith("/") ? "" : "/";
-  return `file://${leading}${encoded}`;
 }
 
 /** Converts an LSP line/character position into a flat UTF-16 offset. */

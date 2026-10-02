@@ -11,12 +11,24 @@ A safe static-navigation slice that works **without** a running Lisp image.
 
 - Monorepo with clearly separated components (`extension`, `server`,
   `protocol`, `fixtures`, `docs`).
-- Safe, **non-evaluating** parser tolerant of incomplete files.
-- Package-aware static symbol index for the core definers.
+- Safe, **non-evaluating** parser tolerant of incomplete files, including
+  `#+`/`#-` reader conditionals (feature expressions kept inert) and `#;`
+  reader discards.
+- Real workspace indexing at startup plus incremental
+  `workspace/didChangeWatchedFiles` updates; open buffers override disk.
+- Package-aware static symbol index for the core definers, with nickname
+  **canonicalization** so one package has one identity.
+- Lisp-2 namespace model: references resolve by syntactic position, generic
+  functions are preferred over their methods, and resolution never falls back to
+  a wrong same-named symbol in another package. Global vs lexical bindings are
+  modeled (lexical indexing deferred to M2).
 - LSP server: `documentSymbol`, `workspace/symbol`, `definition`, `hover`.
-- VS Code extension: LSP client + native **Lisp Structure** tree view.
-- Sample ASDF fixture project and unit/integration tests.
-- CI building and testing both the server and the extension.
+- VS Code extension: LSP client + native, **read-only** **Lisp Structure** tree
+  view, with the trace setting wired through standard LSP configuration.
+- Sample ASDF fixture project and unit/integration tests (including
+  workspace-scan and file-change coverage).
+- CI building and testing both the server and the extension with `npm ci` and
+  least-privilege `permissions: contents: read`.
 
 ## Milestone 2 — Richer static intelligence
 
