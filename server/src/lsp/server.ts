@@ -163,21 +163,31 @@ export function createServer(connection: Connection): ServerHandle {
       .catch(() => undefined);
   });
 
-  connection.onDidChangeWatchedFiles((params: DidChangeWatchedFilesParams) => {
-    for (const change of params.changes) {
-      const uri = change.uri;
-      // Open buffers are authoritative; ignore disk events for them.
-      if (openDocuments.has(uri)) continue;
-      if (!isSourceUri(uri)) continue;
-      if (change.type === FileChangeType.Deleted) {
-        index.removeDocument(uri);
-      } else {
-        void reindexFromDisk(uri);
+  connection.onDidChangeWatchedFiles(
+    async (params: DidChangeWatchedFilesParams): Promise<void> => {
+      // Deletions are synchronous (just drop the document), but reindexing a
+      // created/modified closed file reads from disk asynchronously. Apply all
+      // watcher changes first and AWAIT every reindex, then refresh diagnostics
+      // for open buffers — otherwise diagnostics would be recomputed against a
+      // half-updated index (the M2 watched-file race).
+      const reindexes: Promise<void>[] = [];
+      for (const change of params.changes) {
+        const uri = change.uri;
+        // Open buffers are authoritative; ignore disk events for them.
+        if (openDocuments.has(uri)) continue;
+        if (!isSourceUri(uri)) continue;
+        if (change.type === FileChangeType.Deleted) {
+          index.removeDocument(uri);
+        } else {
+          reindexes.push(reindexFromDisk(uri));
+        }
       }
-    }
-    // A disk-side package change can affect diagnostics in open buffers.
-    publishAllOpen();
-  });
+      await Promise.all(reindexes);
+      // A disk-side package change can affect diagnostics in open buffers; now
+      // that every reindex has settled, the refresh sees the up-to-date index.
+      publishAllOpen();
+    },
+  );
 
   connection.onDocumentSymbol(async (params): Promise<DocumentSymbol[]> => {
     await ready;
