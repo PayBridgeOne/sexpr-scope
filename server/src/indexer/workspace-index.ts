@@ -1,4 +1,4 @@
-import { Document, parseDocument } from "../parser/reader";
+import { Document, NodeKind, parseDocument } from "../parser/reader";
 import {
   BUILTIN_PACKAGES,
   BindingScope,
@@ -25,6 +25,12 @@ import {
   globalIdentityOf,
 } from "../model/resolution";
 import { analyzeScopes } from "../analyzer/scope-analyzer";
+import {
+  SemanticTokenInfo,
+  classifyToken,
+  isNumericToken,
+  splitQualifiedRanges,
+} from "../analyzer/token-classifier";
 import { DocumentIndex, indexDocument, packageAtOffset } from "./document-indexer";
 import { PackageResolver, PackageSymbolAccess } from "./package-resolver";
 
@@ -479,6 +485,48 @@ export class WorkspaceIndex {
         entry.globalDefByOffset,
       ),
     );
+  }
+
+  /**
+   * Produces semantic tokens for a document from the unified semantic model.
+   *
+   * Every token's type/modifiers come from the same `classifyOccurrence` result
+   * that drives navigation, so highlighting never diverges from Go-to-Definition.
+   * Numeric literals are skipped, and a package-qualified reference is split into
+   * a `namespace` token for the prefix and a token for the symbol itself.
+   */
+  semanticTokens(uri: string): SemanticTokenInfo[] {
+    this.ensureFresh();
+    const entry = this.entries.get(uri);
+    if (!entry) return [];
+    const tokens: SemanticTokenInfo[] = [];
+    for (const occ of entry.occurrences) {
+      if (occ.node.kind !== NodeKind.Atom) continue;
+      if (isNumericToken(occ.node.text)) continue;
+      const semantic = this.classifyOccurrence(
+        uri,
+        entry.scope,
+        occ,
+        entry.bindingByOffset,
+        entry.globalDefByOffset,
+      );
+      const cls = classifyToken(semantic, occ.reference);
+      if (!cls) continue;
+      const { packageRange, symbolRange } = splitQualifiedRanges(
+        occ.node,
+        occ.reference,
+      );
+      if (packageRange) {
+        tokens.push({ range: packageRange, type: "namespace", modifiers: [] });
+      }
+      tokens.push({ range: symbolRange, type: cls.type, modifiers: cls.modifiers });
+    }
+    tokens.sort(
+      (a, b) =>
+        a.range.start.line - b.range.start.line ||
+        a.range.start.character - b.range.start.character,
+    );
+    return tokens;
   }
 
   /** The occurrence whose atom spans `offset`, if any. */

@@ -9,6 +9,8 @@ import {
   InitializeResult,
   Location,
   ReferenceParams,
+  SemanticTokens,
+  SemanticTokensParams,
   SymbolInformation,
   TextDocumentSyncKind,
   TextDocuments,
@@ -18,6 +20,11 @@ import {
 import { TextDocument } from "vscode-languageserver-textdocument";
 import { URI } from "vscode-languageserver";
 import { WorkspaceIndex } from "../indexer/workspace-index";
+import {
+  TOKEN_MODIFIERS,
+  TOKEN_TYPES,
+  encodeSemanticTokens,
+} from "../analyzer/token-classifier";
 import {
   isSourceUri,
   reindexUriFromDisk,
@@ -95,6 +102,13 @@ export function createServer(connection: Connection): ServerHandle {
         definitionProvider: true,
         referencesProvider: true,
         hoverProvider: true,
+        semanticTokensProvider: {
+          legend: {
+            tokenTypes: [...TOKEN_TYPES],
+            tokenModifiers: [...TOKEN_MODIFIERS],
+          },
+          full: true,
+        },
       },
       serverInfo: { name: "sexpr-scope-server", version: "0.1.0" },
     };
@@ -201,6 +215,15 @@ export function createServer(connection: Connection): ServerHandle {
     }
     return null;
   });
+
+  connection.languages.semanticTokens.on(
+    async (params: SemanticTokensParams): Promise<SemanticTokens> => {
+      await ready;
+      const uri = params.textDocument.uri;
+      if (!index.hasDocument(uri)) return { data: [] };
+      return { data: encodeSemanticTokens(index.semanticTokens(uri)) };
+    },
+  );
 
   documents.listen(connection);
   connection.listen();
