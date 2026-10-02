@@ -14,8 +14,23 @@ import {
   ReferenceOccurrence,
   collectReferences,
 } from "../model/reference";
-import { LexicalBinding, Scope } from "../model/scope";
+import { LexicalBinding, LexicalBindingKind, Scope } from "../model/scope";
 import { isLambdaListKeyword } from "../model/language";
+import {
+  CompletionCandidate,
+  CompletionKind,
+} from "../model/intelligence";
+import {
+  DIAGNOSTIC_SOURCE,
+  DiagnosticInfo,
+} from "../model/diagnostic";
+import {
+  completionContextAt,
+  CompletionContext,
+} from "../analyzer/completion-context";
+import { findEnclosingList } from "../analyzer/form-context";
+import { SignatureModel, buildSignature } from "../analyzer/signature";
+import { isAtom, stripPrefixes } from "../parser/reader";
 import {
   OccurrenceRole,
   ReferenceLocation,
@@ -648,6 +663,364 @@ export class WorkspaceIndex {
 
   get documentUris(): string[] {
     return [...this.entries.keys()];
+  }
+
+  // ---------------------------------------------------------------------------
+  // Completion, signature help and diagnostics.
+  //
+  // All three consume the same lexical/package model used for navigation, so
+  // what completes and what a signature/diagnostic reports always matches what
+  // resolves. None of them evaluates Lisp.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Context-aware completion candidates at a source offset.
+   *
+   * Candidates are gathered from (in priority order) the visible lexical
+   * environment, then package-accessible global symbols, filtered by the Lisp-2
+   * namespace implied by the cursor position and by any package qualifier.
+   * Completion is suppressed inside strings, comments and quoted data.
+   */
+  completions(uri: string, offset: number): CompletionCandidate[] {
+    this.ensureFresh();
+    const entry = this.entries.get(uri);
+    if (!entry) return [];
+    const ctx = completionContextAt(entry.doc, offset);
+    if (!ctx) return [];
+
+    const results: CompletionCandidate[] = [];
+    const lexicalShadow = new Set<string>();
+
+    // 1. Lexical bindings in scope (only for an unqualified token).
+    if (!ctx.packagePrefix) {
+      for (const b of entry.scope.visibleBindings(offset)) {
+        if (b.namespace !== ctx.namespace) continue;
+        if (!b.name.startsWith(ctx.prefix)) continue;
+        const key = `${b.namespace}:${b.name}`;
+        lexicalShadow.add(key);
+        results.push(this.lexicalCandidate(b, ctx));
+      }
+    }
+
+    // 2. Global symbols: qualified against a specific package, or unqualified
+    //    through the package accessibility model for the current package.
+    const chosen = new Map<string, { sym: SymbolDefinition; rank: number }>();
+    const consider = (sym: SymbolDefinition, rank: number): void => {
+      if (sym.scope !== BindingScope.Global) return;
+      if (sym.namespace !== ctx.namespace) return;
+      if (!sym.name.startsWith(ctx.prefix)) return;
+      const gkey = `${sym.namespace}:${sym.package}:${sym.name}`;
+      const prev = chosen.get(gkey);
+      // Prefer a non-method definition (the generic) over its method impls.
+      if (prev && (!prev.sym.methodImplementation || sym.methodImplementation)) {
+        return;
+      }
+      chosen.set(gkey, { sym, rank });
+    };
+
+    if (ctx.packagePrefix) {
+      const targetPackage = this.resolvePackageName(ctx.packagePrefix);
+      const external = ctx.qualification === "external";
+      for (const sym of this.allSymbols()) {
+        if (sym.package !== targetPackage) continue;
+        if (external && sym.exported !== true) continue;
+        consider(sym, external ? 2 : 3);
+      }
+    } else {
+      const currentPackage = this.packageAt(uri, offset);
+      for (const sym of this.allSymbols()) {
+        if (sym.scope !== BindingScope.Global) continue;
+        if (lexicalShadow.has(`${sym.namespace}:${sym.name}`)) continue;
+        const access = this.packageAccess(currentPackage, sym.name);
+        if (access.status !== "present" && access.status !== "inherited") continue;
+        if (access.homePackage !== sym.package) continue;
+        consider(sym, rankForVia(access.via));
+      }
+    }
+
+    for (const { sym, rank } of chosen.values()) {
+      results.push(this.globalCandidate(sym, ctx, rank));
+    }
+
+    results.sort(
+      (a, b) => a.sortRank - b.sortRank || a.label.localeCompare(b.label),
+    );
+    return results.slice(0, 300);
+  }
+
+  private lexicalCandidate(
+    b: LexicalBinding,
+    ctx: CompletionContext,
+  ): CompletionCandidate {
+    const label = downcaseName(b.name);
+    return {
+      label,
+      insertText: label,
+      kind: completionKindOfLexical(b.bindingKind),
+      namespace: b.namespace,
+      detail: b.lambdaList
+        ? `${lexicalKindText(b.bindingKind)} ${b.lambdaList}`
+        : lexicalKindText(b.bindingKind),
+      sortRank: 0,
+      replaceRange: ctx.replaceRange,
+    };
+  }
+
+  private globalCandidate(
+    sym: SymbolDefinition,
+    ctx: CompletionContext,
+    rank: number,
+  ): CompletionCandidate {
+    const label = downcaseName(sym.name);
+    const detailParts: string[] = [];
+    if (sym.lambdaList) detailParts.push(sym.lambdaList);
+    detailParts.push(downcaseName(sym.package));
+    return {
+      label,
+      insertText: label,
+      kind: completionKindOfSymbol(sym.kind),
+      namespace: sym.namespace,
+      package: sym.package,
+      detail: detailParts.join("  "),
+      documentation: sym.documentation,
+      sortRank: rank,
+      replaceRange: ctx.replaceRange,
+    };
+  }
+
+  /**
+   * Static signature help for the call enclosing a source offset.
+   *
+   * The lambda list is taken from the callable's definition (global function /
+   * generic / macro, or a lexical `flet`/`labels` function) and presented as-is.
+   * No macro is expanded and no running image is consulted.
+   */
+  signatureHelp(uri: string, offset: number): SignatureModel | undefined {
+    this.ensureFresh();
+    const entry = this.entries.get(uri);
+    if (!entry) return undefined;
+    const enclosing = findEnclosingList(entry.doc, offset);
+    if (!enclosing || enclosing.data) return undefined;
+    const list = enclosing.list;
+    const headNode = stripPrefixes(list.children[0]);
+    if (!headNode || !isAtom(headNode)) return undefined;
+    // Only help once the operator has been typed and the cursor is in the args.
+    if (offset <= headNode.range.end.offset) return undefined;
+
+    const resolution = this.resolveAt(uri, headNode.range.start.offset);
+    if (!resolution) return undefined;
+    const target = resolution.target;
+
+    let name: string;
+    let lambdaList: string | undefined;
+    let documentation: string | undefined;
+    if (target.kind === "global") {
+      const sym = target.symbols.find((s) => s.lambdaList) ?? target.symbols[0];
+      if (!sym) return undefined;
+      name = downcaseName(sym.name);
+      lambdaList = sym.lambdaList;
+      documentation = sym.documentation;
+    } else if (target.kind === "lexical") {
+      if (target.binding.namespace !== Namespace.Function) return undefined;
+      name = downcaseName(target.binding.name);
+      lambdaList = target.binding.lambdaList;
+    } else {
+      return undefined;
+    }
+    if (!lambdaList) return undefined;
+
+    // Count complete argument forms before the cursor (children after the head).
+    let activeArgument = 0;
+    for (let i = 1; i < list.children.length; i++) {
+      if (list.children[i].range.end.offset <= offset) activeArgument++;
+      else break;
+    }
+    return buildSignature(name, lambdaList, activeArgument, documentation);
+  }
+
+  /**
+   * Conservative static diagnostics for a document.
+   *
+   * Only issues that are safe to infer without a running Lisp image are emitted:
+   * an unknown explicit package, an external `pkg:foo` reference to a symbol that
+   * is defined in `pkg` but not exported, an ambiguously inherited symbol, and a
+   * clearly invalid duplicate parameter / local-function binding. Unknown
+   * functions/values are *never* reported — static analysis cannot prove them
+   * invalid, so no diagnostic is preferred over a false positive.
+   */
+  diagnostics(uri: string): DiagnosticInfo[] {
+    this.ensureFresh();
+    const entry = this.entries.get(uri);
+    if (!entry) return [];
+    const out: DiagnosticInfo[] = [];
+
+    for (const occ of entry.occurrences) {
+      const ref = occ.reference;
+      if (ref.context === ReferenceContext.Data) continue;
+      const offset = occ.node.range.start.offset;
+      if (entry.bindingByOffset.has(offset)) continue;
+      if (entry.globalDefByOffset.has(offset)) continue;
+      if (isLambdaListKeyword(ref.name)) continue;
+
+      if (
+        ref.packagePrefix &&
+        (ref.qualification === "external" || ref.qualification === "internal")
+      ) {
+        const prefix = ref.packagePrefix;
+        if (!this.packageResolver.knows(prefix)) {
+          out.push({
+            range: occ.node.range,
+            message: `Unknown package ${downcaseName(prefix)}.`,
+            severity: "warning",
+            code: "unknown-package",
+            source: DIAGNOSTIC_SOURCE,
+          });
+          continue;
+        }
+        if (
+          ref.qualification === "external" &&
+          this.packageResolver.defines(prefix, ref.name) &&
+          !this.packageResolver.exports(prefix, ref.name)
+        ) {
+          out.push({
+            range: occ.node.range,
+            message: `${downcaseName(ref.name)} is not exported from ${downcaseName(prefix)}.`,
+            severity: "warning",
+            code: "not-exported",
+            source: DIAGNOSTIC_SOURCE,
+          });
+        }
+      } else if (ref.qualification === "none") {
+        const access = this.packageAccess(this.packageAt(uri, offset), ref.name);
+        if (access.status === "ambiguous") {
+          out.push({
+            range: occ.node.range,
+            message: `${downcaseName(ref.name)} is inherited ambiguously from ${access.candidatePackages
+              .map(downcaseName)
+              .join(", ")}.`,
+            severity: "warning",
+            code: "ambiguous-symbol",
+            source: DIAGNOSTIC_SOURCE,
+          });
+        }
+      }
+    }
+
+    // Duplicate bindings, restricted to forms where repetition is unambiguously
+    // invalid (parameters and local functions). LET/LET* variables are skipped
+    // because `let*` legitimately rebinds the same name.
+    const visitScope = (scope: Scope): void => {
+      const seen = new Set<string>();
+      for (const b of scope.bindings) {
+        if (
+          b.bindingKind !== LexicalBindingKind.Parameter &&
+          b.bindingKind !== LexicalBindingKind.LocalFunction &&
+          b.bindingKind !== LexicalBindingKind.LocalMacro
+        ) {
+          continue;
+        }
+        const key = `${b.namespace}:${b.name}`;
+        if (seen.has(key)) {
+          out.push({
+            range: b.selectionRange,
+            message: `Duplicate binding ${downcaseName(b.name)} in the same form.`,
+            severity: "warning",
+            code: "duplicate-binding",
+            source: DIAGNOSTIC_SOURCE,
+          });
+        } else {
+          seen.add(key);
+        }
+      }
+      for (const child of scope.children) visitScope(child);
+    };
+    visitScope(entry.scope);
+
+    out.sort(
+      (a, b) =>
+        a.range.start.line - b.range.start.line ||
+        a.range.start.character - b.range.start.character,
+    );
+    return out;
+  }
+}
+
+/** Deterministic rank for an accessible global symbol by how it is accessed. */
+function rankForVia(via: string): number {
+  switch (via) {
+    case "definition":
+    case "shadow":
+      return 2;
+    case "import":
+    case "shadowing-import":
+      return 3;
+    default:
+      return 4; // inheritance
+  }
+}
+
+/** Downcases a canonical print name for insertion into typically-lowercase source. */
+function downcaseName(name: string): string {
+  return name.toLowerCase();
+}
+
+function lexicalKindText(kind: LexicalBindingKind): string {
+  switch (kind) {
+    case LexicalBindingKind.Parameter:
+      return "parameter";
+    case LexicalBindingKind.LetVariable:
+      return "lexical variable";
+    case LexicalBindingKind.LocalFunction:
+      return "local function";
+    case LexicalBindingKind.LocalMacro:
+      return "local macro";
+    case LexicalBindingKind.SymbolMacro:
+      return "symbol macro";
+    case LexicalBindingKind.MultipleValue:
+      return "lexical variable";
+    case LexicalBindingKind.Destructuring:
+      return "lexical variable";
+  }
+}
+
+function completionKindOfLexical(kind: LexicalBindingKind): CompletionKind {
+  switch (kind) {
+    case LexicalBindingKind.LocalFunction:
+      return CompletionKind.LocalFunction;
+    case LexicalBindingKind.LocalMacro:
+      return CompletionKind.LocalMacro;
+    case LexicalBindingKind.Parameter:
+      return CompletionKind.Parameter;
+    default:
+      return CompletionKind.Variable;
+  }
+}
+
+function completionKindOfSymbol(kind: SymbolKind): CompletionKind {
+  switch (kind) {
+    case SymbolKind.Function:
+      return CompletionKind.Function;
+    case SymbolKind.Macro:
+      return CompletionKind.Macro;
+    case SymbolKind.GenericFunction:
+      return CompletionKind.GenericFunction;
+    case SymbolKind.Method:
+      return CompletionKind.Method;
+    case SymbolKind.Class:
+      return CompletionKind.Class;
+    case SymbolKind.Struct:
+      return CompletionKind.Struct;
+    case SymbolKind.Condition:
+      return CompletionKind.Class;
+    case SymbolKind.Type:
+      return CompletionKind.Type;
+    case SymbolKind.Constant:
+      return CompletionKind.Constant;
+    case SymbolKind.Package:
+      return CompletionKind.Package;
+    case SymbolKind.Variable:
+    case SymbolKind.Parameter:
+      return CompletionKind.Variable;
   }
 }
 

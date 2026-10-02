@@ -93,6 +93,21 @@ export class PackageResolver {
     return this.aliases.get(designator) ?? designator;
   }
 
+  /** True when the designator names a package known to the workspace. */
+  knows(designator: string): boolean {
+    return this.aliases.has(designator);
+  }
+
+  /** True when `name` is interned (home) in package designator `pkg`. */
+  defines(pkg: string, name: string): boolean {
+    return this.definedNames.get(this.canonical(pkg))?.has(name) ?? false;
+  }
+
+  /** True when `name` is exported from package designator `pkg`. */
+  exports(pkg: string, name: string): boolean {
+    return this.exportsFrom(this.canonical(pkg)).has(name);
+  }
+
   private exportsFrom(pkg: string): ReadonlySet<string> {
     return this.exportedNames.get(pkg) ?? EMPTY;
   }
