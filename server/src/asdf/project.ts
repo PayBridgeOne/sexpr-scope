@@ -8,6 +8,10 @@ import { buildComponentGraph } from "./graph";
 import { computeAsdfDiagnostics } from "./diagnostics";
 import { ComponentSource, inferComponentEdges } from "./inference";
 import {
+  analyzePackageInferredSystem,
+  PackageInferredResult,
+} from "./package-inferred";
+import {
   AsdfComponent,
   AsdfDependencyEdge,
   AsdfDiagnostic,
@@ -89,6 +93,15 @@ export interface ComponentDto {
   readonly children: ComponentDto[];
 }
 
+export interface InferredSubsystemDto {
+  readonly name: string;
+  readonly uri: string;
+  readonly packageName?: string;
+  readonly certainty: Certainty;
+  /** Strong package dependencies on other secondary systems. */
+  readonly dependsOn: DependencyEdgeDto[];
+}
+
 export interface SystemDto {
   readonly name: string;
   readonly nameCertainty: Certainty;
@@ -109,6 +122,8 @@ export interface SystemDto {
   readonly components: ComponentDto[];
   /** All component-level edges: declared, serial and inferred. */
   readonly componentEdges: DependencyEdgeDto[];
+  /** Secondary systems for a `:package-inferred-system` (empty otherwise). */
+  readonly inferredSubsystems: InferredSubsystemDto[];
 }
 
 export interface DiagnosticDto {
@@ -137,6 +152,8 @@ export interface AsdfAnalysis {
   readonly componentEdges: AsdfDependencyEdge[];
   readonly inferredEdges: AsdfDependencyEdge[];
   readonly diagnostics: AsdfDiagnostic[];
+  /** Package-inferred secondary systems, keyed by primary system name. */
+  readonly packageInferred: Map<string, PackageInferredResult>;
 }
 
 export interface AsdfProjectOptions {
@@ -217,6 +234,24 @@ export class AsdfProject {
       fileExists: (uri) => this.fileExists(uri),
     });
 
+    // Package-inferred systems: each file under a `:package-inferred-system`
+    // becomes a secondary system with package-derived dependency edges.
+    const packageInferred = new Map<string, PackageInferredResult>();
+    const registeredByUri = new Map(
+      files.map((f) => [f.uri, f.registeredPackages] as const),
+    );
+    for (const sys of systems) {
+      if (!sys.packageInferred) continue;
+      packageInferred.set(
+        sys.name,
+        analyzePackageInferredSystem({
+          index: this.index,
+          system: sys,
+          registeredPackages: registeredByUri.get(sys.uri),
+        }),
+      );
+    }
+
     return {
       files,
       systems,
@@ -226,6 +261,7 @@ export class AsdfProject {
       componentEdges,
       inferredEdges,
       diagnostics,
+      packageInferred,
     };
   }
 
@@ -271,6 +307,21 @@ export class AsdfProject {
       .filter((e) => componentIds.has(e.from) || componentIds.has(e.to))
       .map(edgeDto);
 
+    const pis = analysis.packageInferred.get(sys.name);
+    const inferredSubsystems: InferredSubsystemDto[] = pis
+      ? pis.systems.map((sub) => ({
+          name: sub.name,
+          uri: sub.uri,
+          packageName: sub.packageName,
+          certainty: sub.certainty,
+          dependsOn: pis.edges.filter((e) => e.from === sub.name).map(edgeDto),
+        }))
+      : [];
+    const conditions = [
+      ...sys.conditions.map(conditionDto),
+      ...(pis ? pis.conditions.map(conditionDto) : []),
+    ];
+
     return {
       name: sys.name,
       nameCertainty: sys.nameCertainty,
@@ -286,10 +337,11 @@ export class AsdfProject {
       maintainer: sys.maintainer,
       license: sys.license,
       certainty: sys.certainty,
-      conditions: sys.conditions.map(conditionDto),
+      conditions,
       systemDependencies,
       components: sys.components.map((c) => componentDto(c, sourceOf)),
       componentEdges,
+      inferredSubsystems,
     };
   }
 }

@@ -214,6 +214,28 @@ export interface AsdfSystem {
 export interface AsdfFile {
   readonly uri: string;
   readonly systems: AsdfSystem[];
+  /**
+   * Literal `asdf:register-system-packages` registrations found in the file.
+   * Used for conservative `package-inferred-system` package→system mapping.
+   * Empty when none are present or they are not statically literal.
+   */
+  readonly registeredPackages: AsdfRegisteredPackages[];
+}
+
+/**
+ * A statically literal `(asdf:register-system-packages SYSTEM (PKG…))` form.
+ *
+ * Only pure-literal forms are captured; computed system names or package lists
+ * are skipped rather than guessed.
+ */
+export interface AsdfRegisteredPackages {
+  /** The system name the packages are registered to (coerced literal). */
+  readonly system: string;
+  /** Canonical UPPERCASE package names registered to the system. */
+  readonly packages: string[];
+  /** Range of the whole registration form. */
+  readonly range: Range;
+  readonly certainty: Certainty;
 }
 
 /** A conservative ASDF project diagnostic (missing component, cycle, …). */

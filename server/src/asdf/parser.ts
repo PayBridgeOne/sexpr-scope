@@ -18,6 +18,7 @@ import {
   AsdfCondition,
   AsdfFile,
   AsdfReference,
+  AsdfRegisteredPackages,
   AsdfSystem,
   Certainty,
   componentId,
@@ -48,6 +49,7 @@ const KNOWN_FILE_TYPES = new Set(["FILE", "CL-SOURCE-FILE", "CL-SOURCE-FILE.CL"]
 
 export function parseAsdfFile(doc: Document): AsdfFile {
   const systems: AsdfSystem[] = [];
+  const registeredPackages: AsdfRegisteredPackages[] = [];
   const asdPath = fsPathFromUri(doc.uri);
   // Component paths resolve relative to the directory containing the `.asd`.
   const baseDir = asdPath !== undefined ? path.dirname(asdPath) : undefined;
@@ -68,6 +70,11 @@ export function parseAsdfFile(doc: Document): AsdfFile {
           if (system) systems.push(system);
           return; // do not re-scan the system body for more systems
         }
+        if (op === "REGISTER-SYSTEM-PACKAGES") {
+          const reg = parseRegisterSystemPackages(doc, node);
+          if (reg) registeredPackages.push(reg);
+          return;
+        }
         // Arbitrary surrounding Lisp: descend to find a nested defsystem.
         for (const child of node.children) scan(child, feature);
         return;
@@ -80,7 +87,41 @@ export function parseAsdfFile(doc: Document): AsdfFile {
   };
 
   for (const root of doc.roots) scan(root, undefined);
-  return { uri: doc.uri, systems };
+  return { uri: doc.uri, systems, registeredPackages };
+}
+
+// ---------------------------------------------------------------------------
+// register-system-packages (package-inferred-system support)
+// ---------------------------------------------------------------------------
+
+/**
+ * Extracts a literal `(asdf:register-system-packages SYSTEM (PKG…))` form.
+ *
+ * Only fully literal registrations are captured. A computed system name or a
+ * non-literal package list is skipped entirely rather than guessed; package
+ * names are canonicalized to UPPERCASE to match the M2 package index.
+ */
+function parseRegisterSystemPackages(
+  doc: Document,
+  form: ListNode,
+): AsdfRegisteredPackages | undefined {
+  const systemNode = stripPrefixes(form.children[1]);
+  const listNode = stripPrefixes(form.children[2]);
+  if (!systemNode || !listNode) return undefined;
+  const sys = coerceName(doc, systemNode);
+  if (!sys || sys.certainty !== Certainty.Known) return undefined;
+  if (!isList(listNode)) return undefined;
+  const packages: string[] = [];
+  let certainty = Certainty.Known;
+  for (const child of listNode.children) {
+    const name = coerceName(doc, child);
+    if (!name || name.certainty !== Certainty.Known) {
+      certainty = Certainty.Dynamic;
+      continue;
+    }
+    packages.push(name.name.toUpperCase());
+  }
+  return { system: sys.name, packages, range: form.range, certainty };
 }
 
 // ---------------------------------------------------------------------------
@@ -695,7 +736,7 @@ function combineCertainty(...values: Certainty[]): Certainty {
   return worst;
 }
 
-function fsPathFromUri(uri: string): string | undefined {
+export function fsPathFromUri(uri: string): string | undefined {
   try {
     const u = new URL(uri);
     if (u.protocol !== "file:") return undefined;
@@ -706,6 +747,6 @@ function fsPathFromUri(uri: string): string | undefined {
 }
 
 /** Encodes an already-absolute fs path as a `file:` URI (matches the index). */
-function uriFromFsPath(fsPath: string): string {
+export function uriFromFsPath(fsPath: string): string {
   return pathToFileURL(fsPath).href;
 }
