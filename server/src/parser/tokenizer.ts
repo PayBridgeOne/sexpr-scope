@@ -23,6 +23,10 @@ export enum TokenType {
   BlockComment = "block-comment",
   /** ' ` , ,@ #' and the #. read-eval marker: structural prefixes only. */
   Prefix = "prefix",
+  /** `#+feature` / `#-feature` reader conditional: a feature test + guarded datum. */
+  ReaderConditional = "reader-conditional",
+  /** `#;` reader discard: the following datum is discarded, never evaluated. */
+  Discard = "discard",
   /** `#(` vector open; closed by a normal RParen. */
   VectorOpen = "vector-open",
   /** Any atom: symbols, numbers, characters (`#\\x`), keywords, etc. */
@@ -212,15 +216,29 @@ export function tokenize(text: string): Token[] {
         continue;
       }
 
-      // Feature expressions #+feature / #-feature behave as prefixes wrapping
-      // the following test form; keep the whole #+/#- as a prefix token.
+      // Feature expressions #+feature / #-feature behave as reader conditionals
+      // wrapping the following feature test and guarded datum. They are kept as
+      // structural tokens and NEVER evaluated.
       if (next === "+" || next === "-") {
         push({
-          type: TokenType.Prefix,
+          type: TokenType.ReaderConditional,
           start: i,
           end: i + 2,
           text: "#" + next,
           prefix: "#" + next,
+        });
+        i += 2;
+        continue;
+      }
+
+      // Reader discard #; — the following datum is discarded (never evaluated).
+      if (next === ";") {
+        push({
+          type: TokenType.Discard,
+          start: i,
+          end: i + 2,
+          text: "#;",
+          prefix: "#;",
         });
         i += 2;
         continue;

@@ -75,6 +75,14 @@ a self-contained, non-evaluating tokenizer and tolerant tree reader:
 
 - `#.` read-time evaluation is recognized as an inert prefix and **never
   evaluated**; it is treated as ordinary structural data.
+- `#+`/`#-` reader conditionals are parsed structurally: the feature expression
+  (e.g. `SBCL` or `(and sbcl unix)`) is kept as uninterpreted syntax and the
+  guarded datum is wrapped so the indexer can mark anything it defines as
+  conditional. Features are **never evaluated** — static analysis cannot know
+  the live feature set, so a guarded definition is only surfaced when no
+  unconditional one exists.
+- `#;` discards the following datum entirely; the discarded form never
+  contributes a definition (it is treated like a comment).
 - Strings, nested `#| |#` block comments, `#\` character literals, quotes and
   sharpsign forms are lexed structurally.
 - The reader tolerates partially written / syntactically incomplete files
@@ -91,6 +99,24 @@ the non-evaluation guarantee. The parser is isolated behind a narrow interface
 (`parseDocument`), so swapping in tree-sitter later — if its maintenance and
 safety profile justify it — is a contained change.
 
+## Workspace indexing
+
+When an editor initializes the server, SexprScope discovers and statically
+indexes the whole workspace (`server/src/lsp/workspace-fs.ts`):
+
+- Every `.lisp` / `.cl` / `.lsp` / `.asd` file under each workspace folder is
+  read **as text only** and parsed with the non-evaluating parser. Directories
+  that never hold project source (`.git`, `node_modules`, `dist`, `out`,
+  `build`) are skipped.
+- An open editor buffer is authoritative: if a URI is open, its unsaved content
+  is never clobbered by the on-disk copy.
+- File creates/edits/deletes arrive through `workspace/didChangeWatchedFiles`
+  and update the index incrementally (delete removes the document; create/modify
+  re-reads it). Events for open buffers are ignored.
+
+This keeps navigation consistent across files the user has not opened, while
+preserving the hard guarantee that opening a workspace never executes code.
+
 ## Package awareness
 
 Symbols are never treated as global strings. Every symbol carries its owning
@@ -100,26 +126,66 @@ nicknames, so two symbols with the same print name in different packages never
 collide (see `server/src/model/symbol.ts`). `defpackage` options understood in
 M1: `:use`, `:nicknames`, `:export`, `:documentation`.
 
+Package **identities are canonicalized**: a `defpackage` nickname is mapped back
+to its defining package name, so an `in-package` using a nickname (`:pay`) does
+not fork the identity of a symbol defined under the canonical name (`PAYMENT`).
+Standard nicknames not declared by any workspace `defpackage` (e.g. `CL-USER`
+for `COMMON-LISP-USER`) are left as written — the index only knows the packages
+it has actually seen.
+
 ## The static symbol model
 
 `SymbolDefinition` (`server/src/model/symbol.ts`) carries: `name`, `package`,
-`kind`, source `uri`, full `range`, name `selectionRange`, `documentation`,
-`lambdaList`, `exported` status, and `origin` (static vs runtime). The indexer
-recognizes these definers in M1:
+`kind`, `namespace`, binding `scope`, source `uri`, full `range`, name
+`selectionRange`, `documentation`, `lambdaList`, `exported` status, `conditional`
+(set when guarded by `#+`/`#-`), `methodImplementation` (set for `defmethod`),
+and `origin` (static vs runtime). The indexer recognizes these definers in M1:
 
 `defun`, `defmacro`, `define-compiler-macro`, `defgeneric`, `defmethod`,
 `defclass`, `defstruct`, `defvar`, `defparameter`, `defconstant`, `deftype`,
 `define-condition`, and `defpackage`.
 
-Lexical constructs (`let`, `flet`, `labels`, `lambda`, `multiple-value-bind`,
-…) are not yet indexed; the model is shaped so they can be added without
-reworking the symbol type.
+### Lisp-2 namespaces
+
+Common Lisp is a Lisp-2 (really Lisp-N): a name can denote a function, a value,
+a type and a package independently. Each definition records which `Namespace`
+it occupies (function / value / type / package), derived from its definer. A
+reference is resolved using the namespace implied by its **syntactic position**
+(`referenceNamespaceAt`): the head of a list and the target of `#'` / `(function
+…)` require the function namespace; a quoted list head is plain data; other
+positions are left as `any` so resolution considers every namespace rather than
+guessing. Resolution is deliberately conservative — it never falls back to a
+same-named symbol in an unrelated package, because a wrong Go-to-Definition
+target is worse than none.
+
+### Generic functions vs methods
+
+A `defgeneric` is the definition a call site names; its `defmethod`s are
+*implementations*, not peer definitions. When a generic function is present it is
+preferred over its methods for Go-to-Definition; the methods remain queryable
+(`methodsFor`) for future "go to implementations" support. No method dispatch is
+performed — that requires a running image.
+
+### Global vs lexical bindings
+
+The symbol model distinguishes package-global definitions from lexical bindings
+(`scope`), so lexical constructs can be added later **without** inventing a fake
+package owner for a `let`/`flet`/`lambda` variable. M1 only indexes global
+definitions; the shape is in place for M2 lexical scope.
 
 ## LSP features
 
 Implemented in M1 (`server/src/lsp`): `textDocument/documentSymbol`,
-`workspace/symbol`, `textDocument/definition`, `textDocument/hover`. The server
-speaks LSP over stdio and has no VS Code dependency.
+`workspace/symbol`, `textDocument/definition`, `textDocument/hover`, plus
+`workspace/didChangeWatchedFiles` and init-time workspace scanning. Definition
+and hover use the Lisp-2 namespace of the reference position. The server speaks
+LSP over stdio and has no VS Code dependency.
+
+## Structural view (read-only)
+
+The VS Code **Lisp Structure** tree groups a file's definitions by kind for
+navigation only. Structural *editing* of source is intentionally out of scope;
+the tree never rewrites the buffer.
 
 ## Implementation abstraction
 

@@ -52,6 +52,9 @@ function startClient(context: vscode.ExtensionContext): LanguageClient {
         "**/*.{lisp,cl,lsp,asd}",
       ),
     },
+    // Surface trace output (controlled by the `sexprScope.trace.server`
+    // setting, which the client reads automatically) in a dedicated channel.
+    outputChannel: vscode.window.createOutputChannel("SexprScope Language Server"),
   };
 
   return new LanguageClient(

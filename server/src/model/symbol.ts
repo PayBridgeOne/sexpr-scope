@@ -23,26 +23,99 @@ export enum SymbolOrigin {
 }
 
 /**
+ * Common Lisp is a Lisp-2 (really a Lisp-N): a symbol can simultaneously name a
+ * function, a value (special/lexical variable), a type/class, and a package.
+ * References must be resolved against the namespace implied by their syntactic
+ * position, not by print name alone.
+ */
+export enum Namespace {
+  /** Functions, macros, generic functions, methods: `(foo ...)`, `#'foo`. */
+  Function = "function",
+  /** Special/lexical variables, constants, parameters: `foo`, `(+ foo 1)`. */
+  Value = "value",
+  /** Classes, structs, conditions, deftypes: type specifiers, `make-instance`. */
+  Type = "type",
+  /** Packages named by `defpackage` / referenced by `in-package`, `pkg:sym`. */
+  Package = "package",
+}
+
+/** Maps each definition kind to the namespace it lives in. */
+export function namespaceOfKind(kind: SymbolKind): Namespace {
+  switch (kind) {
+    case SymbolKind.Function:
+    case SymbolKind.Macro:
+    case SymbolKind.GenericFunction:
+    case SymbolKind.Method:
+      return Namespace.Function;
+    case SymbolKind.Variable:
+    case SymbolKind.Parameter:
+    case SymbolKind.Constant:
+      return Namespace.Value;
+    case SymbolKind.Class:
+    case SymbolKind.Struct:
+    case SymbolKind.Condition:
+    case SymbolKind.Type:
+      return Namespace.Type;
+    case SymbolKind.Package:
+      return Namespace.Package;
+  }
+}
+
+/**
+ * Whether a definition is owned by a package (global) or by a lexical scope.
+ *
+ * Global definitions (`defun`, `defvar`, `defclass`, …) belong to a package.
+ * Lexical bindings (`let`, `flet`, lambda parameters, …) belong to a source
+ * region, not a package; M1.1 shapes the model for them so Milestone 2 can add
+ * real lexical scope resolution without reworking the symbol type.
+ */
+export enum BindingScope {
+  Global = "global",
+  Lexical = "lexical",
+}
+
+/**
  * A definition discovered by the static indexer.
  *
- * Names are stored unqualified; the owning package is tracked separately so
- * that symbols with the same print name in different packages never collide.
+ * Names are stored unqualified; for global definitions the owning package is
+ * tracked separately so symbols with the same print name in different packages
+ * never collide. Lexical bindings carry a `scopeRange` instead of a package.
  */
 export interface SymbolDefinition {
   readonly name: string;
-  /** Upper-cased package name that owns this symbol (CL default readtable). */
+  /**
+   * Canonical upper-cased package name that owns a *global* definition. Empty
+   * string for lexical bindings, which are not package-owned.
+   */
   readonly package: string;
   readonly kind: SymbolKind;
+  /** The namespace this definition occupies (derived from `kind`). */
+  readonly namespace: Namespace;
+  /** Global (package-owned) or lexical (scope-owned). */
+  readonly scope: BindingScope;
   readonly uri: string;
   /** Range of the whole defining form. */
   readonly range: Range;
   /** Range of the name token (used as the Go-to-Definition target). */
   readonly selectionRange: Range;
+  /** For lexical bindings: the source region over which the binding is live. */
+  readonly scopeRange?: Range;
   readonly documentation?: string;
   /** Raw source of the lambda list, when applicable. */
   readonly lambdaList?: string;
   /** True when the package's defpackage exports this symbol. */
   readonly exported?: boolean;
+  /**
+   * True when the definition is guarded by a `#+`/`#-` reader conditional. Such
+   * definitions are uncertain under pure static analysis and are excluded from
+   * definite Go-to-Definition resolution.
+   */
+  readonly conditional?: boolean;
+  /**
+   * For `defmethod`: true. Methods are implementations/specializations of a
+   * generic function, not independent function definitions.
+   */
+  readonly methodImplementation?: boolean;
   readonly origin: SymbolOrigin;
 }
 

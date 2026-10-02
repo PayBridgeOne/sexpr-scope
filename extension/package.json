@@ -65,7 +65,8 @@
     "configuration": {
       "title": "SexprScope",
       "properties": {
-        "sexprScope.server.trace": {
+        "sexprScope.trace.server": {
+          "scope": "window",
           "type": "string",
           "enum": [
             "off",

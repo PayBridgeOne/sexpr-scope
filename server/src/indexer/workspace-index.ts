@@ -1,14 +1,29 @@
 import { Document, parseDocument } from "../parser/reader";
 import {
+  BindingScope,
+  Namespace,
   PackageDefinition,
   QualifiedName,
   SymbolDefinition,
+  SymbolKind,
 } from "../model/symbol";
 import { DocumentIndex, indexDocument, packageAtOffset } from "./document-indexer";
 
 interface Entry {
   readonly doc: Document;
   readonly index: DocumentIndex;
+}
+
+/**
+ * The namespace a reference requires, implied by its syntactic position.
+ * `"any"` is used when the position does not disambiguate (e.g. a bare symbol
+ * in data position); resolution then considers every namespace.
+ */
+export type ReferenceNamespace = Namespace | "any";
+
+export interface ResolveOptions {
+  /** Which namespace the reference occupies; defaults to considering any. */
+  readonly namespace?: ReferenceNamespace;
 }
 
 /**
@@ -37,6 +52,10 @@ export class WorkspaceIndex {
   removeDocument(uri: string): void {
     this.entries.delete(uri);
     this.dirty = true;
+  }
+
+  hasDocument(uri: string): boolean {
+    return this.entries.has(uri);
   }
 
   getDocument(uri: string): Document | undefined {
@@ -72,13 +91,27 @@ export class WorkspaceIndex {
     return this.packageAliases.get(designator) ?? designator;
   }
 
-  /** All symbols across the workspace, with export status resolved. */
+  /**
+   * Returns a view of a symbol with its package canonicalized (nicknames mapped
+   * to the defining package) and its export status resolved. Canonicalization
+   * ensures a nickname-based `in-package` does not fork a symbol's identity.
+   */
+  private normalize(sym: SymbolDefinition): SymbolDefinition {
+    if (sym.scope === BindingScope.Lexical) return sym;
+    const canonical = this.packageAliases.get(sym.package) ?? sym.package;
+    const pkg = this.packagesByName.get(canonical);
+    const exported = pkg ? pkg.exports.includes(sym.name) : sym.exported;
+    if (canonical === sym.package && exported === sym.exported) return sym;
+    return { ...sym, package: canonical, exported };
+  }
+
+  /** All (normalized) symbols across the workspace. */
   allSymbols(): SymbolDefinition[] {
     this.ensureFresh();
     const result: SymbolDefinition[] = [];
     for (const { index } of this.entries.values()) {
       for (const sym of index.symbols) {
-        result.push(this.withExportStatus(sym));
+        result.push(this.normalize(sym));
       }
     }
     return result;
@@ -88,46 +121,72 @@ export class WorkspaceIndex {
     this.ensureFresh();
     const entry = this.entries.get(uri);
     if (!entry) return [];
-    return entry.index.symbols.map((s) => this.withExportStatus(s));
+    return entry.index.symbols.map((s) => this.normalize(s));
   }
 
-  private withExportStatus(sym: SymbolDefinition): SymbolDefinition {
-    const pkg = this.packagesByName.get(sym.package);
-    if (!pkg) return sym;
-    const exported = pkg.exports.includes(sym.name);
-    if (exported === sym.exported) return sym;
-    return { ...sym, exported };
-  }
-
-  /** Resolves which package is current at an offset in a given document. */
+  /** Resolves which (canonical) package is current at an offset in a document. */
   packageAt(uri: string, offset: number): string {
     const index = this.entries.get(uri)?.index;
     if (!index) return "COMMON-LISP-USER";
-    return packageAtOffset(index, offset);
+    return this.resolvePackageName(packageAtOffset(index, offset));
   }
 
   /**
    * Finds definitions matching a (possibly qualified) reference.
    *
-   * Resolution order:
-   *   1. exact package + name (package taken from the qualifier, or the
-   *      current package of the reference site when unqualified);
-   *   2. as a fallback, any symbol with the same print name in another
-   *      package, so navigation still succeeds when package data is partial.
+   * Resolution is deliberately conservative: it uses the namespace implied by
+   * the reference position and the current (canonical) package. It never falls
+   * back to an arbitrary same-named symbol from an unrelated package — a wrong
+   * Go-to-Definition target is worse than none.
+   *
+   * Within the resolved package + namespace:
+   *   1. a generic function definition is preferred, if present (methods are its
+   *      implementations, not peer definitions);
+   *   2. otherwise all matching definitions are returned.
+   *
+   * Conditional (`#+`/`#-` guarded) definitions are only returned when no
+   * unconditional definition matches, since static analysis cannot know whether
+   * their feature test holds.
    */
-  resolveReference(ref: QualifiedName, currentPackage: string): SymbolDefinition[] {
+  resolveReference(
+    ref: QualifiedName,
+    currentPackage: string,
+    options: ResolveOptions = {},
+  ): SymbolDefinition[] {
     this.ensureFresh();
     const targetPackage = ref.packagePrefix
       ? this.resolvePackageName(ref.packagePrefix)
       : this.resolvePackageName(currentPackage);
+    const wanted = options.namespace ?? "any";
 
-    const all = this.allSymbols();
-    const exact = all.filter(
-      (s) => s.name === ref.name && s.package === targetPackage,
+    const inPackage = this.allSymbols().filter(
+      (s) =>
+        s.scope === BindingScope.Global &&
+        s.name === ref.name &&
+        s.package === targetPackage &&
+        namespaceMatches(s.namespace, wanted),
     );
-    if (exact.length > 0) return exact;
+    if (inPackage.length === 0) return [];
 
-    return all.filter((s) => s.name === ref.name);
+    const unconditional = inPackage.filter((s) => !s.conditional);
+    const candidates = unconditional.length > 0 ? unconditional : inPackage;
+
+    // Prefer a generic function definition over its method implementations.
+    const generics = candidates.filter(
+      (s) => s.kind === SymbolKind.GenericFunction,
+    );
+    if (generics.length > 0) return generics;
+
+    return candidates;
+  }
+
+  /** Method implementations (`defmethod`) for a function-namespace name. */
+  methodsFor(name: string, pkg: string): SymbolDefinition[] {
+    this.ensureFresh();
+    const canonical = this.resolvePackageName(pkg);
+    return this.allSymbols().filter(
+      (s) => s.methodImplementation && s.name === name && s.package === canonical,
+    );
   }
 
   /** Case-insensitive substring search over symbol names (workspace/symbol). */
@@ -146,4 +205,9 @@ export class WorkspaceIndex {
   get documentUris(): string[] {
     return [...this.entries.keys()];
   }
+}
+
+function namespaceMatches(ns: Namespace, wanted: ReferenceNamespace): boolean {
+  if (wanted === "any") return true;
+  return ns === wanted;
 }

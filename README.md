@@ -8,22 +8,40 @@ editor-grade navigation and understanding on top. The long-term goal is a
 development experience closer to Rider/Visual Studio while keeping the
 interactive and structural strengths that make Lisp unique.
 
-> **Status:** Milestone 1 (foundation). A small but real vertical slice of
-> *static* navigation that works even when no Lisp image is running. See
-> [`docs/ROADMAP.md`](docs/ROADMAP.md) for what comes next.
+> **Status:** Milestone 1 (foundation), hardened. A small but real vertical
+> slice of *static* navigation that works even when no Lisp image is running.
+> See [`docs/ROADMAP.md`](docs/ROADMAP.md) for what comes next.
 
 ## What works today
 
 - **Safe static analysis** — a non-evaluating parser that **never executes your
   code** when a workspace is opened (even `#.` read-time evaluation is treated as
   inert data). Tolerant of incomplete/partially written files.
+- **Reader conditionals & discards** — `#+`/`#-` feature tests are parsed
+  structurally (never evaluated); a guarded definition is only used as a
+  last resort and is marked conditional. `#;` discarded data never creates
+  definitions.
+- **Real workspace indexing** — on startup the server discovers and statically
+  indexes every `.lisp` / `.cl` / `.lsp` / `.asd` file across all workspace
+  folders (skipping `.git`, `node_modules`, `dist`, `out`, `build`). File
+  creations, edits and deletions are picked up incrementally via
+  `workspace/didChangeWatchedFiles`. Open editor buffers always override the
+  on-disk copy.
 - **Package-aware symbol index** — understands `defpackage`/`in-package`,
   qualified names (`pkg:foo`, `pkg::foo`, `:keyword`) and nicknames, so symbols
-  with the same name in different packages don't collide.
+  with the same name in different packages don't collide. Nicknames are
+  canonicalized so `pay:x` and `payment:x` resolve to one identity.
+- **Lisp-2 aware navigation** — references resolve by syntactic position:
+  a list head or `#'name` looks in the function namespace, other positions
+  consider any namespace. Resolution is conservative: it never falls back to a
+  same-named symbol in an unrelated package (no definition beats a wrong one).
+- **Generic functions vs methods** — a call resolves to the `defgeneric`;
+  `defmethod`s are modeled as its implementations, not peer definitions.
 - **LSP features** — Document Symbols, Workspace Symbols, Go to Definition, and
   Hover (kind, lambda list, docstring, export status).
 - **Lisp Structure view** — a native VS Code tree grouping the active file's
-  definitions by kind; click to jump to the source.
+  definitions by kind; click to jump to the source. The structural view is
+  **read-only** (structural *editing* is out of scope for now).
 
 Recognized definitions: `defun`, `defmacro`, `define-compiler-macro`,
 `defgeneric`, `defmethod`, `defclass`, `defstruct`, `defvar`, `defparameter`,
@@ -46,18 +64,19 @@ static-vs-runtime split and the parser-safety rationale.
 ## Building
 
 Requires Node.js ≥ 18. The extension depends on the built server, so build the
-server first.
+server first. CI and reproducible installs use `npm ci` against the committed
+lockfiles.
 
 ```sh
 # Language server
 cd server
-npm install
+npm ci
 npm run build
-npm test        # 28 unit + integration tests
+npm test        # unit + workspace/file-watching integration tests
 
 # VS Code extension
 cd ../extension
-npm install
+npm ci
 npm run build
 ```
 

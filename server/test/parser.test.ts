@@ -1,7 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { tokenize, TokenType } from "../src/parser/tokenizer";
-import { parseDocument, NodeKind, isList, atomAtOffset } from "../src/parser/reader";
+import {
+  parseDocument,
+  NodeKind,
+  isList,
+  atomAtOffset,
+  referenceNamespaceAt,
+} from "../src/parser/reader";
 
 test("tokenizer treats #. read-eval as an inert prefix, never evaluating", () => {
   const tokens = tokenize("(list #.(launch-missiles))");
@@ -61,4 +67,78 @@ test("#' and quote are represented as prefixed wrappers around a datum", () => {
     const fn = root.children[1];
     assert.equal(fn.kind, NodeKind.Prefixed);
   }
+});
+
+test("#+ reader conditional is parsed as a reader-conditional node", () => {
+  const doc = parseDocument("file:///a.lisp", "#+sbcl (defun f () 1)");
+  assert.equal(doc.roots.length, 1);
+  const root = doc.roots[0];
+  assert.equal(root.kind, NodeKind.ReaderConditional);
+  if (root.kind === NodeKind.ReaderConditional) {
+    assert.equal(root.polarity, "+");
+    assert.ok(root.feature && root.feature.kind === NodeKind.Atom);
+    assert.ok(root.child && isList(root.child));
+  }
+});
+
+test("#- reader conditional records negative polarity", () => {
+  const doc = parseDocument("file:///a.lisp", "#-sbcl (defun g () 2)");
+  const root = doc.roots[0];
+  assert.equal(root.kind, NodeKind.ReaderConditional);
+  if (root.kind === NodeKind.ReaderConditional) {
+    assert.equal(root.polarity, "-");
+  }
+});
+
+test("compound #+ feature expression is kept as inert syntax", () => {
+  const doc = parseDocument("file:///a.lisp", "#+(and sbcl unix) (defun h () 3)");
+  const root = doc.roots[0];
+  assert.equal(root.kind, NodeKind.ReaderConditional);
+  if (root.kind === NodeKind.ReaderConditional) {
+    assert.ok(root.feature && isList(root.feature));
+    assert.ok(root.child && isList(root.child));
+  }
+});
+
+test("#; discard wraps a datum and removes it from list children", () => {
+  const doc = parseDocument("file:///a.lisp", "(a #;(b c) d)");
+  const root = doc.roots[0];
+  assert.ok(isList(root));
+  if (isList(root)) {
+    const names = root.children
+      .filter((c) => c.kind === NodeKind.Atom)
+      .map((c) => (c.kind === NodeKind.Atom ? c.text : ""));
+    assert.deepEqual(names, ["a", "d"]);
+  }
+});
+
+test("atomAtOffset does not surface atoms inside a #; discard", () => {
+  const text = "(a #;(b c) d)";
+  const doc = parseDocument("file:///a.lisp", text);
+  const atom = atomAtOffset(doc, text.indexOf("b"));
+  assert.equal(atom, undefined);
+});
+
+test("referenceNamespaceAt marks a list head as the function namespace", () => {
+  const text = "(process tx)";
+  const doc = parseDocument("file:///a.lisp", text);
+  assert.equal(referenceNamespaceAt(doc, text.indexOf("process") + 1), "function");
+});
+
+test("referenceNamespaceAt treats an argument position as any", () => {
+  const text = "(frob process)";
+  const doc = parseDocument("file:///a.lisp", text);
+  assert.equal(referenceNamespaceAt(doc, text.indexOf("process") + 1), "any");
+});
+
+test("referenceNamespaceAt treats #'name as the function namespace", () => {
+  const text = "(mapcar #'process items)";
+  const doc = parseDocument("file:///a.lisp", text);
+  assert.equal(referenceNamespaceAt(doc, text.indexOf("process") + 1), "function");
+});
+
+test("referenceNamespaceAt treats a quoted list head as any, not a call", () => {
+  const text = "'(process tx)";
+  const doc = parseDocument("file:///a.lisp", text);
+  assert.equal(referenceNamespaceAt(doc, text.indexOf("process") + 1), "any");
 });
