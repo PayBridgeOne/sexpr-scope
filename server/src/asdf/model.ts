@@ -76,8 +76,12 @@ export interface DependencyEvidence {
   readonly symbol?: string;
   /** Where the linking symbol / package is defined. */
   readonly definedInUri?: string;
+  /** Range of the definition, when known (for navigation). */
+  readonly definedInRange?: Range;
   /** Where the linking symbol / package is referenced. */
   readonly referencedInUri?: string;
+  /** Range of the reference, when known (for navigation). */
+  readonly referencedInRange?: Range;
 }
 
 /**
