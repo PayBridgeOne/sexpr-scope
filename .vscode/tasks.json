@@ -1,0 +1,28 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build",
+      "dependsOn": ["build-server", "build-extension"],
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "build-server",
+      "type": "shell",
+      "command": "npm install && npm run build",
+      "options": { "cwd": "${workspaceFolder}/server" },
+      "group": "build",
+      "problemMatcher": ["$tsc"]
+    },
+    {
+      "label": "build-extension",
+      "type": "shell",
+      "command": "npm install && npm run build",
+      "options": { "cwd": "${workspaceFolder}/extension" },
+      "dependsOn": ["build-server"],
+      "group": "build",
+      "problemMatcher": ["$tsc"]
+    }
+  ]
+}

@@ -1,0 +1,95 @@
+{
+  "name": "sexpr-scope",
+  "displayName": "SexprScope",
+  "description": "A modern Common Lisp development environment for VS Code: safe static navigation, package-aware symbols and a structural Lisp view.",
+  "version": "0.1.0",
+  "license": "MIT",
+  "publisher": "sexpr-scope",
+  "engines": {
+    "vscode": "^1.84.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:commonlisp"
+  ],
+  "main": "./out/src/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "commonlisp",
+        "aliases": [
+          "Common Lisp",
+          "commonlisp",
+          "lisp"
+        ],
+        "extensions": [
+          ".lisp",
+          ".cl",
+          ".lsp",
+          ".asd"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "sexprScope.structure",
+          "name": "Lisp Structure",
+          "when": "resourceLangId == commonlisp"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "sexprScope.restartServer",
+        "title": "SexprScope: Restart Language Server"
+      },
+      {
+        "command": "sexprScope.refreshStructure",
+        "title": "SexprScope: Refresh Lisp Structure",
+        "icon": "$(refresh)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "sexprScope.refreshStructure",
+          "when": "view == sexprScope.structure",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "SexprScope",
+      "properties": {
+        "sexprScope.server.trace": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Trace the communication between VS Code and the SexprScope language server."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -p ./tsconfig.json",
+    "watch": "tsc -w -p ./tsconfig.json",
+    "vscode:prepublish": "npm run build"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1",
+    "sexpr-scope-server": "file:../server"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.84.0",
+    "typescript": "^5.6.3"
+  }
+}
