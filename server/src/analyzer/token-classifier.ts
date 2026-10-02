@@ -161,6 +161,28 @@ export function classifyToken(
     }
   }
 
+  if (target.kind === "builtin") {
+    // A standardized COMMON-LISP symbol known from the static catalog. It is
+    // never a definition; `defaultLibrary` marks it as standard-library origin.
+    const mods: TokenModifier[] = ["defaultLibrary"];
+    switch (target.builtinKind) {
+      case "special-operator":
+        return { type: "keyword", modifiers: [] };
+      case "macro":
+        return { type: "macro", modifiers: mods };
+      case "function":
+        return { type: "function", modifiers: mods };
+      case "type":
+        return { type: "type", modifiers: mods };
+      case "constant":
+        return { type: "variable", modifiers: [...mods, "readonly"] };
+      case "variable":
+        return { type: "variable", modifiers: [...mods, "special"] };
+      default:
+        return { type: "variable", modifiers: mods };
+    }
+  }
+
   // Unresolved or non-navigable (`none`) occurrences. These are classified from
   // syntax + language knowledge alone, conservatively.
   if (isLambdaListKeyword(ref.name)) return undefined;
