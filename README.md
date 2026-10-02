@@ -30,18 +30,29 @@ interactive and structural strengths that make Lisp unique.
 - **Package-aware symbol index** — understands `defpackage`/`in-package`,
   qualified names (`pkg:foo`, `pkg::foo`, `:keyword`) and nicknames, so symbols
   with the same name in different packages don't collide. Nicknames are
-  canonicalized so `pay:x` and `payment:x` resolve to one identity.
-- **Lisp-2 aware navigation** — references resolve by syntactic position:
-  a list head or `#'name` looks in the function namespace, other positions
-  consider any namespace. Resolution is conservative: it never falls back to a
-  same-named symbol in an unrelated package (no definition beats a wrong one).
+  canonicalized so `pay:x` and `payment:x` resolve to one identity. The standard
+  packages `COMMON-LISP` (`CL`), `COMMON-LISP-USER` (`CL-USER`) and `KEYWORD`
+  are known without being redeclared, so `(in-package :cl-user)` and the default
+  package are one identity. External qualification (`pkg:foo`) resolves **only**
+  to exported symbols; internal qualification (`pkg::foo`) may reach any symbol.
+  Uninterned symbols (`#:foo`) and keywords never resolve to a global
+  definition.
+- **Lisp-2 aware navigation** — references resolve in the namespace implied by
+  their syntactic position: a list head or `#'name` / `(function name)` is a
+  **function** reference; an ordinary evaluated position (e.g. `(+ process 1)`)
+  is a **value** reference; quoted or quasiquoted symbols (`'foo`, `(quote
+  foo)`, `'(foo bar)`) are inert **data** and resolve to nothing. A value
+  reference never resolves to a function-only definition (and vice versa).
+  Resolution is conservative: it never falls back to a same-named symbol in an
+  unrelated package (no definition beats a wrong one).
 - **Generic functions vs methods** — a call resolves to the `defgeneric`;
   `defmethod`s are modeled as its implementations, not peer definitions.
 - **LSP features** — Document Symbols, Workspace Symbols, Go to Definition, and
   Hover (kind, lambda list, docstring, export status).
 - **Lisp Structure view** — a native VS Code tree grouping the active file's
-  definitions by kind; click to jump to the source. The structural view is
-  **read-only** (structural *editing* is out of scope for now).
+  definitions by kind; click to jump to the source. Structural editing is
+  intentionally not part of SexprScope. Structural views are read-only
+  projections of the Lisp source.
 
 Recognized definitions: `defun`, `defmacro`, `define-compiler-macro`,
 `defgeneric`, `defmethod`, `defclass`, `defstruct`, `defvar`, `defparameter`,

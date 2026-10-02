@@ -14,7 +14,7 @@
   "scripts": {
     "build": "tsc -p ./tsconfig.json",
     "watch": "tsc -w -p ./tsconfig.json",
-    "test": "npm run build && node --test \"out/test/**/*.test.js\"",
+    "test": "npm run build && node --test out/test/*.test.js",
     "clean": "rimraf out"
   },
   "dependencies": {

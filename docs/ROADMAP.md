@@ -30,18 +30,45 @@ A safe static-navigation slice that works **without** a running Lisp image.
 - CI building and testing both the server and the extension with `npm ci` and
   least-privilege `permissions: contents: read`.
 
+### Milestone 1.1.1 — Semantic correctness cleanup ✅
+
+A correctness pass hardening the static model before lexical scopes are added:
+
+- Lisp-2 reference contexts are strongly typed as **function / value / data**
+  (`server/src/model/reference.ts`); evaluated value positions no longer use an
+  `"any"` fallback, and a value reference never resolves to a function-only
+  definition.
+- Function designators `#'foo` and `(function foo)` (including `(function (setf
+  foo))`) resolve as function-namespace references.
+- Quoted / quasiquoted symbols (`'foo`, `(quote foo)`, `'(foo bar)`) are treated
+  as inert data and resolve to nothing.
+- Standard packages `COMMON-LISP`/`CL`, `COMMON-LISP-USER`/`CL-USER`, and
+  `KEYWORD` are seeded as builtin identities (no redeclaration needed).
+- External vs internal qualification is enforced: `pkg:foo` resolves only to
+  exported symbols, `pkg::foo` may reach internal symbols.
+- Uninterned symbols (`#:foo`) carry explicit identity and never resolve to a
+  global definition.
+- Workspace initialization is deterministic: semantic requests await a readiness
+  barrier so an unopened file's definitions are available immediately after init.
+- File URI/path handling uses Node's standard `fileURLToPath` / `pathToFileURL`.
+- A clean, in-process LSP integration test covers init → indexing → open → Go to
+  Definition into an unopened file → shutdown with no dangling handles.
+
 ## Milestone 2 — Richer static intelligence
+
+### M2A — Lexical semantics + Find References
 
 - Index lexical constructs: `let`, `let*`, `flet`, `labels`, `macrolet`,
   `symbol-macrolet`, `lambda`, `multiple-value-bind`, `destructuring-bind`.
-- `textDocument/references` and `textDocument/completion`.
-- `textDocument/signatureHelp` from captured lambda lists.
-- `textDocument/publishDiagnostics` for clearly static problems (e.g. duplicate
-  definitions, unbalanced forms).
-- Full package resolution through `:import-from`, `:shadow`,
-  `:shadowing-import-from`.
+- `textDocument/references` (Find References) over the resulting scopes.
 
-## Milestone 3 — Semantic highlighting
+### M2B — Full package resolution
+
+- Resolve symbols through `:use`, `:import-from`, `:shadow`, and
+  `:shadowing-import-from`, building on the M1.1.1 external/internal and builtin
+  package foundations.
+
+### M2C — Semantic Tokens
 
 - `textDocument/semanticTokens` distinguishing special operators, macros,
   functions, generic functions, methods, classes, types, constants, special
@@ -50,7 +77,14 @@ A safe static-navigation slice that works **without** a running Lisp image.
 - Theme-aware decorations only; never hard-coded colors. Parentheses stay
   visible and editable.
 
-## Milestone 4 — ASDF project model
+### M2D — Completion, Signature Help, Diagnostics
+
+- `textDocument/completion` and `textDocument/signatureHelp` from captured
+  lambda lists.
+- `textDocument/publishDiagnostics` for clearly static problems (e.g. duplicate
+  definitions, unbalanced forms).
+
+## Milestone 3 — ASDF project model
 
 - Detect `.asd` files and build a static (untrusted) project model.
 - Understand `:components`, `:file`, `:module`, `:depends-on`, `:serial`,
@@ -60,28 +94,36 @@ A safe static-navigation slice that works **without** a running Lisp image.
 - Project tree view; code actions to edit dependencies/reorder components —
   always with a preview, never rewriting `.asd` files automatically.
 
-## Milestone 5 — Live runtime
+## Milestone 4 — Live SBCL runtime
 
 - Implement the runtime RPC protocol (`protocol/RUNTIME-PROTOCOL.md`) against an
   explicitly started, trusted SBCL image.
 - Merge runtime metadata with the static model (`origin` already distinguishes
   the two sources).
-- `LispImplementation` boundary kept SBCL-only for now; CCL/ECL later.
+- `LispImplementation` boundary kept SBCL-only at first; CCL/ECL later.
 
-## Milestone 6 — Integrated REPL
+## Milestone 5 — REPL + Inspector
 
 - A first-class REPL that knows returned values are Lisp objects, offering
   type-aware rendering and `[Inspect]` affordances rather than a raw terminal.
 
-## Milestone 7 — Structural & dependency visualization
+## Milestone 6 — Debugger / Conditions / Restarts
+
+- Surface the Common Lisp condition system interactively: break into the
+  debugger, inspect the restart set, and choose restarts from the editor.
+
+## Milestone 7 — Dependency UX
 
 - Structural navigation beyond a flat definition tree.
 - ASDF dependency graphs and cycle visualization (Webviews reserved for genuinely
   custom visualizations like these).
+- Dependency management across Qlot, Quicklisp, Ultralisp, Git, and local
+  systems.
 - Refactoring support.
 
 ## Non-goals
 
 - Changing Common Lisp or introducing a new dialect.
-- Structural *editing* of source (navigation is read-only for now).
+- Structural editing of source. Structural views are read-only projections of
+  the Lisp source; navigation never rewrites the buffer.
 - Hiding or replacing parentheses.
