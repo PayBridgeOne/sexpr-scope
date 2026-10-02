@@ -15,3 +15,9 @@
 *.sx32fsl
 *.wx64fsl
 *.wx32fsl
+
+# Node / TypeScript build output
+node_modules/
+out/
+*.tsbuildinfo
+*.vsix
