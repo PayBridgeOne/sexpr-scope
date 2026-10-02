@@ -9,7 +9,13 @@ import { Token, TokenType, tokenize } from "./tokenizer";
  * carries no evaluated meaning — a `#.` form is represented as a `Prefixed`
  * node wrapping an inert datum, exactly like a quote.
  */
-export type SyntaxNode = ListNode | AtomNode | StringNode | PrefixedNode;
+export type SyntaxNode =
+  | ListNode
+  | AtomNode
+  | StringNode
+  | PrefixedNode
+  | ReaderConditionalNode
+  | DiscardNode;
 
 export enum NodeKind {
   List = "list",
@@ -17,6 +23,10 @@ export enum NodeKind {
   Atom = "atom",
   String = "string",
   Prefixed = "prefixed",
+  /** `#+feature` / `#-feature`: a feature test guarding a datum. */
+  ReaderConditional = "reader-conditional",
+  /** `#;`: a datum discarded by the reader (never evaluated, never indexed). */
+  Discard = "discard",
 }
 
 export interface BaseNode {
@@ -47,6 +57,22 @@ export interface StringNode extends BaseNode {
 export interface PrefixedNode extends BaseNode {
   readonly kind: NodeKind.Prefixed;
   readonly prefix: string;
+  readonly child: SyntaxNode | undefined;
+}
+
+export interface ReaderConditionalNode extends BaseNode {
+  readonly kind: NodeKind.ReaderConditional;
+  /** `+` keeps the datum when the feature is present, `-` when absent. */
+  readonly polarity: "+" | "-";
+  /** The (uninterpreted) feature expression, e.g. `SBCL` or `(and sbcl linux)`. */
+  readonly feature: SyntaxNode | undefined;
+  /** The datum guarded by the feature test. */
+  readonly child: SyntaxNode | undefined;
+}
+
+export interface DiscardNode extends BaseNode {
+  readonly kind: NodeKind.Discard;
+  /** The datum discarded by `#;` — present in the tree only for ranges. */
   readonly child: SyntaxNode | undefined;
 }
 
@@ -126,6 +152,10 @@ class Reader {
           };
         case TokenType.Prefix:
           return this.parsePrefixed(tok);
+        case TokenType.ReaderConditional:
+          return this.parseReaderConditional(tok);
+        case TokenType.Discard:
+          return this.parseDiscard(tok);
         case TokenType.Atom:
           this.pos++;
           return {
@@ -153,6 +183,43 @@ class Reader {
     };
   }
 
+  /**
+   * Reads a `#+` / `#-` reader conditional structurally: a feature test datum
+   * followed by the guarded datum. The feature expression is NOT interpreted —
+   * static analysis cannot know the live feature set — so the guarded datum is
+   * wrapped and later excluded from definite resolution by the indexer.
+   */
+  private parseReaderConditional(tok: Token): ReaderConditionalNode {
+    this.pos++;
+    const polarity = tok.prefix === "#-" ? "-" : "+";
+    const feature = this.parseDatum();
+    const child = this.parseDatum();
+    const end = child
+      ? child.range.end.offset
+      : feature
+        ? feature.range.end.offset
+        : tok.end;
+    return {
+      kind: NodeKind.ReaderConditional,
+      range: this.range(tok.start, end),
+      polarity,
+      feature,
+      child,
+    };
+  }
+
+  /** Reads a `#;` discard: one datum is consumed and marked discarded. */
+  private parseDiscard(tok: Token): DiscardNode {
+    this.pos++;
+    const child = this.parseDatum();
+    const end = child ? child.range.end.offset : tok.end;
+    return {
+      kind: NodeKind.Discard,
+      range: this.range(tok.start, end),
+      child,
+    };
+  }
+
   private parseList(open: Token, _openType: TokenType, kind: NodeKind.List | NodeKind.Vector): ListNode {
     this.pos++; // consume opener
     const children: SyntaxNode[] = [];
@@ -172,7 +239,11 @@ class Reader {
       }
       const child = this.parseDatum();
       if (!child) break;
-      children.push(child);
+      // A `#;` discard inside a list contributes nothing but its range still
+      // advances the cursor; drop it from the structural children.
+      if (child.kind !== NodeKind.Discard) {
+        children.push(child);
+      }
       end = child.range.end.offset;
     }
     if (unclosed) {
@@ -232,12 +303,79 @@ export function atomAtOffset(doc: Document, offset: number): AtomNode | undefine
       if (node.child) visit(node.child);
       return;
     }
+    if (node.kind === NodeKind.ReaderConditional) {
+      if (node.feature) visit(node.feature);
+      if (node.child) visit(node.child);
+      return;
+    }
+    if (node.kind === NodeKind.Discard) {
+      // Discarded data are comments; do not surface atoms inside them.
+      return;
+    }
     if (isList(node)) {
       for (const child of node.children) visit(child);
     }
   };
   for (const root of doc.roots) visit(root);
   return found;
+}
+
+/**
+ * The namespace a reference at `offset` requires, implied by its syntactic
+ * position. This is the Lisp-2 disambiguation used by Go-to-Definition:
+ *
+ *  - head of a list, `(foo ...)`           → the function namespace;
+ *  - after a `#'` / `(function ...)` wrapper → the function namespace;
+ *  - everything else (argument, value form) → `"any"`.
+ *
+ * `"any"` (rather than the value namespace) is used in ambiguous data position
+ * because a bare symbol there may name a variable OR be passed as a designator;
+ * resolution then considers every namespace instead of guessing wrong.
+ */
+export function referenceNamespaceAt(
+  doc: Document,
+  offset: number,
+): "function" | "any" {
+  let result: "function" | "any" = "any";
+
+  // `functionHead`: the node sits in operator (callable) position.
+  // `quoted`:       the node is inside a `'`/`` ` `` quoted datum, so a list
+  //                 head there is plain data, not a function call.
+  const visit = (node: SyntaxNode, functionHead: boolean, quoted: boolean) => {
+    if (!(offset >= node.range.start.offset && offset <= node.range.end.offset)) {
+      return;
+    }
+    if (node.kind === NodeKind.Atom) {
+      if (functionHead) result = "function";
+      return;
+    }
+    if (node.kind === NodeKind.Prefixed) {
+      if (node.prefix === "#'") {
+        // `#'foo` / `(function foo)`: the datum is explicitly a function.
+        if (node.child) visit(node.child, true, false);
+      } else {
+        const nowQuoted = quoted || node.prefix === "'" || node.prefix === "`";
+        if (node.child) visit(node.child, functionHead, nowQuoted);
+      }
+      return;
+    }
+    if (node.kind === NodeKind.ReaderConditional) {
+      if (node.child) visit(node.child, functionHead, quoted);
+      return;
+    }
+    if (node.kind === NodeKind.Discard) {
+      return;
+    }
+    if (isList(node)) {
+      for (let i = 0; i < node.children.length; i++) {
+        // Index 0 is the operator; it names a function unless quoted.
+        visit(node.children[i], i === 0 && !quoted, quoted);
+      }
+    }
+  };
+
+  for (const root of doc.roots) visit(root, false, false);
+  return result;
 }
 
 export { tokenize };

@@ -9,11 +9,13 @@ import {
 } from "../parser/reader";
 import { Range } from "../parser/position";
 import {
+  BindingScope,
   PackageDefinition,
   SymbolDefinition,
   SymbolKind,
   SymbolOrigin,
   canonicalizeName,
+  namespaceOfKind,
   parseQualifiedName,
 } from "../model/symbol";
 
@@ -192,81 +194,111 @@ export function indexDocument(doc: Document): DocumentIndex {
   const packageSegments: PackageSegment[] = [
     { offset: 0, packageName: DEFAULT_PACKAGE },
   ];
-  let currentPackage = DEFAULT_PACKAGE;
+  const state = { currentPackage: DEFAULT_PACKAGE };
 
   for (const root of doc.roots) {
-    const form = stripPrefixes(root);
-    if (!isList(form)) continue;
-    const op = headName(form);
-    if (!op) continue;
-
-    if (op === "IN-PACKAGE") {
-      const pkg = nameFromPackageDesignator(form.children[1]);
-      if (pkg) {
-        currentPackage = pkg;
-        packageSegments.push({ offset: form.range.start.offset, packageName: pkg });
+    // A `#+`/`#-` reader conditional guards its datum; index the guarded form
+    // but mark anything it defines as conditional (uncertain under static
+    // analysis). The feature expression itself is never interpreted.
+    if (root.kind === NodeKind.ReaderConditional) {
+      if (root.child) {
+        indexForm(doc, root.child, state, true, symbols, packages, packageSegments);
       }
       continue;
     }
-
-    if (op === "DEFPACKAGE") {
-      const pkg = parseDefpackage(doc, form);
-      if (pkg) {
-        packages.push(pkg);
-        symbols.push({
-          name: pkg.name,
-          package: "KEYWORD",
-          kind: SymbolKind.Package,
-          uri: doc.uri,
-          range: pkg.range,
-          selectionRange: pkg.selectionRange,
-          documentation: pkg.documentation,
-          origin: SymbolOrigin.Static,
-        });
-      }
-      continue;
-    }
-
-    const kind = DEFINERS.get(op);
-    if (!kind) continue;
-
-    const extracted = extractName(form.children[1]);
-    if (!extracted) continue;
-
-    // defmethod may carry qualifiers between the name and the lambda list.
-    const lambdaList =
-      HAS_LAMBDA_LIST.has(kind) && firstListFrom(form, 2)
-        ? rawText(doc, firstListFrom(form, 2)!.range)
-        : undefined;
-
-    let documentation: string | undefined;
-    if (
-      kind === SymbolKind.Class ||
-      kind === SymbolKind.Struct ||
-      kind === SymbolKind.Condition
-    ) {
-      documentation = documentationOption(form);
-    } else if (HAS_LAMBDA_LIST.has(kind)) {
-      documentation = firstStringFrom(form, 3);
-    } else {
-      // Variables / parameters / constants: docstring after the value form.
-      documentation = firstStringFrom(form, 3);
-    }
-
-    symbols.push({
-      name: extracted.name,
-      package: extracted.packagePrefix ?? currentPackage,
-      kind,
-      uri: doc.uri,
-      range: form.range,
-      selectionRange: extracted.selection,
-      documentation,
-      lambdaList,
-      origin: SymbolOrigin.Static,
-    });
+    indexForm(doc, root, state, false, symbols, packages, packageSegments);
   }
 
   return { uri: doc.uri, symbols, packages, packageSegments };
+}
+
+/** Indexes a single top-level form (possibly guarded by a reader conditional). */
+function indexForm(
+  doc: Document,
+  node: SyntaxNode,
+  state: { currentPackage: string },
+  conditional: boolean,
+  symbols: SymbolDefinition[],
+  packages: PackageDefinition[],
+  packageSegments: PackageSegment[],
+): void {
+  const form = stripPrefixes(node);
+  if (!isList(form)) return;
+  const op = headName(form);
+  if (!op) return;
+
+  if (op === "IN-PACKAGE") {
+    const pkg = nameFromPackageDesignator(form.children[1]);
+    // A conditional in-package must not silently rebind the current package for
+    // following unconditional forms; only apply it unconditionally.
+    if (pkg && !conditional) {
+      state.currentPackage = pkg;
+      packageSegments.push({ offset: form.range.start.offset, packageName: pkg });
+    }
+    return;
+  }
+
+  if (op === "DEFPACKAGE") {
+    const pkg = parseDefpackage(doc, form);
+    if (pkg) {
+      packages.push(pkg);
+      symbols.push({
+        name: pkg.name,
+        package: "KEYWORD",
+        kind: SymbolKind.Package,
+        namespace: namespaceOfKind(SymbolKind.Package),
+        scope: BindingScope.Global,
+        uri: doc.uri,
+        range: pkg.range,
+        selectionRange: pkg.selectionRange,
+        documentation: pkg.documentation,
+        conditional: conditional || undefined,
+        origin: SymbolOrigin.Static,
+      });
+    }
+    return;
+  }
+
+  const kind = DEFINERS.get(op);
+  if (!kind) return;
+
+  const extracted = extractName(form.children[1]);
+  if (!extracted) return;
+
+  // defmethod may carry qualifiers between the name and the lambda list.
+  const lambdaList =
+    HAS_LAMBDA_LIST.has(kind) && firstListFrom(form, 2)
+      ? rawText(doc, firstListFrom(form, 2)!.range)
+      : undefined;
+
+  let documentation: string | undefined;
+  if (
+    kind === SymbolKind.Class ||
+    kind === SymbolKind.Struct ||
+    kind === SymbolKind.Condition
+  ) {
+    documentation = documentationOption(form);
+  } else {
+    // Functions/macros/generics/methods/types and variables/parameters/constants
+    // all place a docstring after the name + lambda-list / value form.
+    documentation = firstStringFrom(form, 3);
+  }
+
+  symbols.push({
+    name: extracted.name,
+    package: extracted.packagePrefix ?? state.currentPackage,
+    kind,
+    namespace: namespaceOfKind(kind),
+    scope: BindingScope.Global,
+    uri: doc.uri,
+    range: form.range,
+    selectionRange: extracted.selection,
+    documentation,
+    lambdaList,
+    conditional: conditional || undefined,
+    methodImplementation: kind === SymbolKind.Method ? true : undefined,
+    origin: SymbolOrigin.Static,
+  });
 }
 
 /** Resolves which package is current at a given offset within a document. */
