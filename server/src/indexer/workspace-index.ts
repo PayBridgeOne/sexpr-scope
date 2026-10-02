@@ -9,11 +9,35 @@ import {
   SymbolDefinition,
   SymbolKind,
 } from "../model/symbol";
+import {
+  ReferenceContext,
+  ReferenceOccurrence,
+  collectReferences,
+} from "../model/reference";
+import { LexicalBinding, Scope } from "../model/scope";
+import { isLambdaListKeyword } from "../model/language";
+import {
+  OccurrenceRole,
+  ReferenceLocation,
+  Resolution,
+  ResolvedTarget,
+  SemanticOccurrence,
+  globalIdentityOf,
+} from "../model/resolution";
+import { analyzeScopes } from "../analyzer/scope-analyzer";
 import { DocumentIndex, indexDocument, packageAtOffset } from "./document-indexer";
 
 interface Entry {
   readonly doc: Document;
   readonly index: DocumentIndex;
+  /** The document's lexical scope tree. */
+  readonly scope: Scope;
+  /** Every classified symbol occurrence in the document, in source order. */
+  readonly occurrences: ReferenceOccurrence[];
+  /** Lexical binding name-token start offset → binding (declaration lookup). */
+  readonly bindingByOffset: Map<number, LexicalBinding>;
+  /** Global definition name-token start offset → definition (declaration lookup). */
+  readonly globalDefByOffset: Map<number, SymbolDefinition>;
 }
 
 /**
@@ -46,7 +70,28 @@ export class WorkspaceIndex {
   setDocument(uri: string, text: string): DocumentIndex {
     const doc = parseDocument(uri, text);
     const index = indexDocument(doc);
-    this.entries.set(uri, { doc, index });
+    const scope = analyzeScopes(doc);
+    const occurrences = collectReferences(doc);
+
+    const bindingByOffset = new Map<number, LexicalBinding>();
+    for (const binding of scope.allBindings()) {
+      bindingByOffset.set(binding.selectionRange.start.offset, binding);
+    }
+    const globalDefByOffset = new Map<number, SymbolDefinition>();
+    for (const sym of index.symbols) {
+      if (sym.scope === BindingScope.Global) {
+        globalDefByOffset.set(sym.selectionRange.start.offset, sym);
+      }
+    }
+
+    this.entries.set(uri, {
+      doc,
+      index,
+      scope,
+      occurrences,
+      bindingByOffset,
+      globalDefByOffset,
+    });
     this.dirty = true;
     return index;
   }
@@ -202,6 +247,248 @@ export class WorkspaceIndex {
     if (generics.length > 0) return generics;
 
     return candidates;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Unified semantic resolution.
+  //
+  // Go to Definition, Find References, Hover, semantic tokens and completion all
+  // resolve through `classifyOccurrence` / `resolveAt` so they share one notion
+  // of lexical and package identity rather than approximating Common Lisp
+  // semantics independently (a wrong target is worse than none).
+  // ---------------------------------------------------------------------------
+
+  /** The document's lexical scope tree, if indexed. */
+  getScope(uri: string): Scope | undefined {
+    return this.entries.get(uri)?.scope;
+  }
+
+  /** Every classified symbol occurrence in a document, in source order. */
+  occurrencesIn(uri: string): ReferenceOccurrence[] {
+    return this.entries.get(uri)?.occurrences ?? [];
+  }
+
+  /**
+   * Classifies one occurrence into a semantic target.
+   *
+   * Resolution order follows Common Lisp lexical scoping: a declaration name is
+   * recognised first, then an unqualified reference is resolved against the
+   * lexical environment (shadowing globals), and only then against the package /
+   * global index. Data, keywords, uninterned and lambda-list keywords never
+   * resolve to a binding.
+   */
+  private classifyOccurrence(
+    uri: string,
+    scope: Scope,
+    occ: ReferenceOccurrence,
+    bindingByOffset: Map<number, LexicalBinding>,
+    globalDefByOffset: Map<number, SymbolDefinition>,
+  ): SemanticOccurrence {
+    const node = occ.node;
+    const ref = occ.reference;
+    const offset = node.range.start.offset;
+
+    // A declaration: the binding/definition's own name token.
+    const binding = bindingByOffset.get(offset);
+    if (binding) {
+      return {
+        node,
+        role: OccurrenceRole.Definition,
+        target: { kind: "lexical", identity: binding.id, binding },
+      };
+    }
+    const gdef = globalDefByOffset.get(offset);
+    if (gdef) {
+      // Canonicalize the package (e.g. CL-USER → COMMON-LISP-USER) so a
+      // definition and its references share one global identity.
+      const def = this.normalize(gdef);
+      return {
+        node,
+        role: OccurrenceRole.Definition,
+        target: {
+          kind: "global",
+          identity: globalIdentityOf(def.package, def.name, def.namespace),
+          namespace: def.namespace,
+          name: def.name,
+          package: def.package,
+          symbols: [def],
+        },
+      };
+    }
+
+    // Quoted/literal data and lambda-list keywords are not binding references.
+    if (ref.context === ReferenceContext.Data || isLambdaListKeyword(ref.name)) {
+      return { node, role: OccurrenceRole.Reference, target: { kind: "none" } };
+    }
+
+    const namespace =
+      ref.context === ReferenceContext.Function
+        ? Namespace.Function
+        : Namespace.Value;
+
+    // Lexical scope shadows globals, but only an unqualified symbol can name a
+    // lexical binding (`pkg:foo` always denotes a package symbol).
+    if (ref.qualification === "none") {
+      const b = scope.resolve(offset, ref.name, namespace);
+      if (b) {
+        return {
+          node,
+          role: OccurrenceRole.Reference,
+          target: { kind: "lexical", identity: b.id, binding: b },
+        };
+      }
+    }
+
+    // Keywords and uninterned symbols have no global definition to navigate to.
+    if (ref.qualification === "keyword" || ref.qualification === "uninterned") {
+      return { node, role: OccurrenceRole.Reference, target: { kind: "none" } };
+    }
+
+    const currentPackage = this.packageAt(uri, offset);
+    const targetPackage = ref.packagePrefix
+      ? this.resolvePackageName(ref.packagePrefix)
+      : this.resolvePackageName(currentPackage);
+    const defs = this.resolveReference(ref, currentPackage, { namespace });
+    if (defs.length > 0) {
+      const pkg = defs[0].package;
+      return {
+        node,
+        role: OccurrenceRole.Reference,
+        target: {
+          kind: "global",
+          identity: globalIdentityOf(pkg, ref.name, namespace),
+          namespace,
+          name: ref.name,
+          package: pkg,
+          symbols: defs,
+        },
+      };
+    }
+
+    // Well-formed but statically unknown: a stable identity still lets Find
+    // References group equal uses, while Go to Definition yields no location.
+    return {
+      node,
+      role: OccurrenceRole.Reference,
+      target: {
+        kind: "unresolved",
+        identity: globalIdentityOf(targetPackage, ref.name, namespace),
+        namespace,
+        name: ref.name,
+        package: targetPackage,
+      },
+    };
+  }
+
+  /** Classifies every occurrence in a document (shared by tokens/references). */
+  classifyDocument(uri: string): SemanticOccurrence[] {
+    this.ensureFresh();
+    const entry = this.entries.get(uri);
+    if (!entry) return [];
+    return entry.occurrences.map((occ) =>
+      this.classifyOccurrence(
+        uri,
+        entry.scope,
+        occ,
+        entry.bindingByOffset,
+        entry.globalDefByOffset,
+      ),
+    );
+  }
+
+  /** The occurrence whose atom spans `offset`, if any. */
+  private occurrenceAt(
+    entry: Entry,
+    offset: number,
+  ): ReferenceOccurrence | undefined {
+    let found: ReferenceOccurrence | undefined;
+    for (const occ of entry.occurrences) {
+      const { start, end } = occ.node.range;
+      if (offset >= start.offset && offset <= end.offset) found = occ;
+    }
+    return found;
+  }
+
+  /**
+   * Resolves the symbol at a source offset to its semantic target. This is the
+   * single entry point behind Go to Definition, Find References and Hover.
+   */
+  resolveAt(uri: string, offset: number): Resolution | undefined {
+    this.ensureFresh();
+    const entry = this.entries.get(uri);
+    if (!entry) return undefined;
+    const occ = this.occurrenceAt(entry, offset);
+    if (!occ) return undefined;
+    const semantic = this.classifyOccurrence(
+      uri,
+      entry.scope,
+      occ,
+      entry.bindingByOffset,
+      entry.globalDefByOffset,
+    );
+    return { occurrence: semantic, target: semantic.target };
+  }
+
+  /**
+   * Finds every reference to the symbol at a source offset.
+   *
+   * Lexical bindings are resolved within their own document and stay confined to
+   * the binding's scope (two same-named `let` variables are distinct). Global
+   * symbols are matched across the whole workspace by semantic identity, so a
+   * generic function and its method call sites group together while an unrelated
+   * same-named symbol in another package never does. `includeDeclaration`
+   * controls whether the binding/definition site itself is included.
+   */
+  findReferences(
+    uri: string,
+    offset: number,
+    includeDeclaration: boolean,
+  ): ReferenceLocation[] {
+    const resolution = this.resolveAt(uri, offset);
+    if (!resolution) return [];
+    const target = resolution.target;
+    if (target.kind === "none") return [];
+    const identity = target.identity;
+    const results: ReferenceLocation[] = [];
+
+    const collectFrom = (docUri: string, entry: Entry): void => {
+      for (const occ of entry.occurrences) {
+        const semantic = this.classifyOccurrence(
+          docUri,
+          entry.scope,
+          occ,
+          entry.bindingByOffset,
+          entry.globalDefByOffset,
+        );
+        if (semantic.target.kind === "none") continue;
+        if (semantic.target.identity !== identity) continue;
+        if (semantic.role === OccurrenceRole.Definition && !includeDeclaration) {
+          continue;
+        }
+        results.push({
+          uri: docUri,
+          range: semantic.node.range,
+          role: semantic.role,
+        });
+      }
+    };
+
+    if (target.kind === "lexical") {
+      // Lexical references never escape the binding's own document.
+      const bindingUri = target.binding.uri;
+      const entry = this.entries.get(bindingUri);
+      if (entry) collectFrom(bindingUri, entry);
+      return results;
+    }
+
+    // Global / unresolved: scan the workspace, pre-filtered by print name.
+    const name = target.name;
+    for (const [docUri, entry] of this.entries) {
+      const hasName = entry.occurrences.some((o) => o.reference.name === name);
+      if (!hasName) continue;
+      collectFrom(docUri, entry);
+    }
+    return results;
   }
 
   /** Method implementations (`defmethod`) for a function-namespace name. */

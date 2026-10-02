@@ -8,6 +8,7 @@ import {
   InitializeParams,
   InitializeResult,
   Location,
+  ReferenceParams,
   SymbolInformation,
   TextDocumentSyncKind,
   TextDocuments,
@@ -16,10 +17,7 @@ import {
 } from "vscode-languageserver";
 import { TextDocument } from "vscode-languageserver-textdocument";
 import { URI } from "vscode-languageserver";
-import { WorkspaceIndex, ReferenceNamespace } from "../indexer/workspace-index";
-import { atomAtOffset } from "../parser/reader";
-import { DEFAULT_PACKAGE, Namespace, QualifiedName } from "../model/symbol";
-import { Reference, ReferenceContext, referenceAt } from "../model/reference";
+import { WorkspaceIndex } from "../indexer/workspace-index";
 import {
   isSourceUri,
   reindexUriFromDisk,
@@ -29,6 +27,7 @@ import {
 import {
   hoverMarkdown,
   kindLabel,
+  lexicalHoverMarkdown,
   toLspRange,
   toLspSymbolKind,
 } from "./conversions";
@@ -94,6 +93,7 @@ export function createServer(connection: Connection): ServerHandle {
         documentSymbolProvider: true,
         workspaceSymbolProvider: true,
         definitionProvider: true,
+        referencesProvider: true,
         hoverProvider: true,
       },
       serverInfo: { name: "sexpr-scope-server", version: "0.1.0" },
@@ -150,20 +150,31 @@ export function createServer(connection: Connection): ServerHandle {
     const doc = index.getDocument(uri);
     if (!doc) return [];
     const offset = offsetOf(doc.text, params.position.line, params.position.character);
-    const reference = referenceAt(doc, offset);
-    if (!reference) return [];
-    const namespace = namespaceForContext(reference.context);
-    // A quoted/literal data symbol is not a binding reference: return nothing
-    // rather than guess a function or value definition.
-    if (namespace === undefined) return [];
-    const currentPackage = index.packageAt(uri, offset);
-    const defs = index.resolveReference(toQualifiedName(reference), currentPackage, {
-      namespace,
-    });
-    return defs.map((sym) => ({
-      uri: sym.uri,
-      range: toLspRange(sym.selectionRange),
-    }));
+    const resolution = index.resolveAt(uri, offset);
+    if (!resolution) return [];
+    const target = resolution.target;
+    if (target.kind === "lexical") {
+      return [{ uri: target.binding.uri, range: toLspRange(target.binding.selectionRange) }];
+    }
+    if (target.kind === "global") {
+      return target.symbols.map((sym) => ({
+        uri: sym.uri,
+        range: toLspRange(sym.selectionRange),
+      }));
+    }
+    // `unresolved` / `none`: no location to navigate to (conservative).
+    return [];
+  });
+
+  connection.onReferences(async (params: ReferenceParams): Promise<Location[]> => {
+    await ready;
+    const uri = params.textDocument.uri;
+    const doc = index.getDocument(uri);
+    if (!doc) return [];
+    const offset = offsetOf(doc.text, params.position.line, params.position.character);
+    const includeDeclaration = params.context?.includeDeclaration ?? true;
+    const refs = index.findReferences(uri, offset, includeDeclaration);
+    return refs.map((r) => ({ uri: r.uri, range: toLspRange(r.range) }));
   });
 
   connection.onHover(async (params): Promise<Hover | null> => {
@@ -172,52 +183,29 @@ export function createServer(connection: Connection): ServerHandle {
     const doc = index.getDocument(uri);
     if (!doc) return null;
     const offset = offsetOf(doc.text, params.position.line, params.position.character);
-    const reference = referenceAt(doc, offset);
-    if (!reference) return null;
-    const namespace = namespaceForContext(reference.context);
-    if (namespace === undefined) return null;
-    const currentPackage = index.packageAt(uri, offset);
-    const defs = index.resolveReference(toQualifiedName(reference), currentPackage, {
-      namespace,
-    });
-    if (defs.length === 0) return null;
-    const atom = atomAtOffset(doc, offset);
-    return {
-      contents: { kind: "markdown", value: hoverMarkdown(defs[0]) },
-      range: atom ? toLspRange(atom.range) : undefined,
-    };
+    const resolution = index.resolveAt(uri, offset);
+    if (!resolution) return null;
+    const target = resolution.target;
+    const range = toLspRange(resolution.occurrence.node.range);
+    if (target.kind === "lexical") {
+      return {
+        contents: { kind: "markdown", value: lexicalHoverMarkdown(target.binding) },
+        range,
+      };
+    }
+    if (target.kind === "global" && target.symbols.length > 0) {
+      return {
+        contents: { kind: "markdown", value: hoverMarkdown(target.symbols[0]) },
+        range,
+      };
+    }
+    return null;
   });
 
   documents.listen(connection);
   connection.listen();
 
   return { whenReady: ready };
-}
-
-/** Projects a classified reference onto the resolver's `QualifiedName` shape. */
-function toQualifiedName(reference: Reference): QualifiedName {
-  return {
-    name: reference.name,
-    packagePrefix: reference.packagePrefix,
-    qualification: reference.qualification,
-  };
-}
-
-/**
- * Maps a Lisp-2 reference context onto the namespace the resolver should search.
- * Returns `undefined` for data positions, which must not resolve at all.
- */
-function namespaceForContext(
-  context: ReferenceContext,
-): ReferenceNamespace | undefined {
-  switch (context) {
-    case ReferenceContext.Function:
-      return Namespace.Function;
-    case ReferenceContext.Value:
-      return Namespace.Value;
-    case ReferenceContext.Data:
-      return undefined;
-  }
 }
 
 /**
