@@ -30,10 +30,11 @@ test("keyword :foo lives in the KEYWORD package", () => {
   assert.equal(q.qualification, "keyword");
 });
 
-test("uninterned #:g is treated as an unqualified name", () => {
+test("uninterned #:g is modeled with explicit uninterned identity", () => {
   const q = parseQualifiedName("#:gensym");
   assert.equal(q.name, "GENSYM");
-  assert.equal(q.qualification, "none");
+  assert.equal(q.qualification, "uninterned");
+  assert.equal(q.packagePrefix, undefined);
 });
 
 test("vertical-bar escaping preserves case and colons", () => {

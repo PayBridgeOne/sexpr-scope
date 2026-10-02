@@ -107,10 +107,17 @@ export interface SymbolDefinition {
   readonly exported?: boolean;
   /**
    * True when the definition is guarded by a `#+`/`#-` reader conditional. Such
-   * definitions are uncertain under pure static analysis and are excluded from
-   * definite Go-to-Definition resolution.
+   * definitions are uncertain under pure static analysis: they are only surfaced
+   * as best-effort candidates and are flagged so the UI never presents them as
+   * unconditionally active.
    */
   readonly conditional?: boolean;
+  /**
+   * For a conditional definition, the raw (uninterpreted) feature expression
+   * that guards it, e.g. `sbcl` or `(and sbcl unix)`. Preserved verbatim for
+   * future runtime feature reconciliation; it is never evaluated statically.
+   */
+  readonly featureExpression?: string;
   /**
    * For `defmethod`: true. Methods are implementations/specializations of a
    * generic function, not independent function definitions.
@@ -132,13 +139,39 @@ export interface PackageDefinition {
 }
 
 /**
- * How a symbol reference spells its package qualification.
- *  - keyword:   leading colon, e.g. `:foo`
- *  - external:  `pkg:foo`
- *  - internal:  `pkg::foo`
- *  - none:      bare `foo`, resolved against the current package
+ * Standard Common Lisp package identities that exist in every conforming image
+ * and can be known statically without any workspace `defpackage`. Seeding these
+ * lets `CL` resolve to `COMMON-LISP` and `CL-USER` to `COMMON-LISP-USER` even
+ * when the workspace never (re)declares the standard nicknames.
  */
-export type QualificationKind = "none" | "keyword" | "external" | "internal";
+export interface BuiltinPackage {
+  readonly name: string;
+  readonly nicknames: readonly string[];
+}
+
+export const BUILTIN_PACKAGES: readonly BuiltinPackage[] = [
+  { name: "COMMON-LISP", nicknames: ["CL"] },
+  { name: "COMMON-LISP-USER", nicknames: ["CL-USER"] },
+  { name: "KEYWORD", nicknames: [] },
+];
+
+/** Canonical name of the package assumed before any `in-package` form. */
+export const DEFAULT_PACKAGE = "COMMON-LISP-USER";
+
+/**
+ * How a symbol reference spells its package qualification.
+ *  - keyword:     leading colon, e.g. `:foo` (a self-evaluating KEYWORD symbol)
+ *  - external:    `pkg:foo` — must name a symbol *exported* from `pkg`
+ *  - internal:    `pkg::foo` — may name any symbol in `pkg`
+ *  - uninterned:  `#:foo` — a fresh, package-less symbol with no global identity
+ *  - none:        bare `foo`, resolved against the current package
+ */
+export type QualificationKind =
+  | "none"
+  | "keyword"
+  | "external"
+  | "internal"
+  | "uninterned";
 
 export interface QualifiedName {
   readonly packagePrefix?: string;
@@ -176,9 +209,14 @@ export function canonicalizeName(raw: string): string {
  */
 export function parseQualifiedName(token: string): QualifiedName {
   let text = token;
-  // Drop an uninterned-symbol marker.
+  // An uninterned-symbol marker `#:foo` denotes a symbol with no package and no
+  // global identity. It is modeled explicitly so it never resolves to a global
+  // `CURRENT-PACKAGE:FOO` with the same print name.
   if (text.startsWith("#:")) {
-    return { name: canonicalizeName(text.slice(2)), qualification: "none" };
+    return {
+      name: canonicalizeName(text.slice(2)),
+      qualification: "uninterned",
+    };
   }
 
   // Locate the first unescaped colon run, respecting |...| escapes.

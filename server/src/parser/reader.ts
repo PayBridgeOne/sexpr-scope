@@ -321,61 +321,10 @@ export function atomAtOffset(doc: Document, offset: number): AtomNode | undefine
 }
 
 /**
- * The namespace a reference at `offset` requires, implied by its syntactic
- * position. This is the Lisp-2 disambiguation used by Go-to-Definition:
- *
- *  - head of a list, `(foo ...)`           → the function namespace;
- *  - after a `#'` / `(function ...)` wrapper → the function namespace;
- *  - everything else (argument, value form) → `"any"`.
- *
- * `"any"` (rather than the value namespace) is used in ambiguous data position
- * because a bare symbol there may name a variable OR be passed as a designator;
- * resolution then considers every namespace instead of guessing wrong.
+ * The namespace a reference at `offset` requires is derived from its syntactic
+ * position by `referenceAt` in `../model/reference`. The reference model keeps
+ * the Lisp-2 classification (function / value / data) next to the package
+ * model, so the reader stays a pure structural parser.
  */
-export function referenceNamespaceAt(
-  doc: Document,
-  offset: number,
-): "function" | "any" {
-  let result: "function" | "any" = "any";
-
-  // `functionHead`: the node sits in operator (callable) position.
-  // `quoted`:       the node is inside a `'`/`` ` `` quoted datum, so a list
-  //                 head there is plain data, not a function call.
-  const visit = (node: SyntaxNode, functionHead: boolean, quoted: boolean) => {
-    if (!(offset >= node.range.start.offset && offset <= node.range.end.offset)) {
-      return;
-    }
-    if (node.kind === NodeKind.Atom) {
-      if (functionHead) result = "function";
-      return;
-    }
-    if (node.kind === NodeKind.Prefixed) {
-      if (node.prefix === "#'") {
-        // `#'foo` / `(function foo)`: the datum is explicitly a function.
-        if (node.child) visit(node.child, true, false);
-      } else {
-        const nowQuoted = quoted || node.prefix === "'" || node.prefix === "`";
-        if (node.child) visit(node.child, functionHead, nowQuoted);
-      }
-      return;
-    }
-    if (node.kind === NodeKind.ReaderConditional) {
-      if (node.child) visit(node.child, functionHead, quoted);
-      return;
-    }
-    if (node.kind === NodeKind.Discard) {
-      return;
-    }
-    if (isList(node)) {
-      for (let i = 0; i < node.children.length; i++) {
-        // Index 0 is the operator; it names a function unless quoted.
-        visit(node.children[i], i === 0 && !quoted, quoted);
-      }
-    }
-  };
-
-  for (const root of doc.roots) visit(root, false, false);
-  return result;
-}
 
 export { tokenize };

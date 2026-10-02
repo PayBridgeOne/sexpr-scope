@@ -64,6 +64,15 @@ export function hoverMarkdown(sym: SymbolDefinition): string {
   lines.push("```");
   const meta = `*${kindLabel(sym.kind)}${sym.exported ? ", exported" : ""}*`;
   lines.push(meta);
+  if (sym.conditional) {
+    // Be honest about uncertainty: a `#+`/`#-` guarded definition may or may not
+    // exist in a given image. Static analysis never evaluates the feature test.
+    const guard = sym.featureExpression ? ` \`#${sym.featureExpression}\`` : "";
+    lines.push("");
+    lines.push(
+      `⚠️ Conditionally defined${guard}; availability depends on runtime features.`,
+    );
+  }
   if (sym.documentation) {
     lines.push("");
     lines.push(sym.documentation);

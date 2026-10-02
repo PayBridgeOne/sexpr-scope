@@ -1,6 +1,8 @@
 import { Document, parseDocument } from "../parser/reader";
 import {
+  BUILTIN_PACKAGES,
   BindingScope,
+  DEFAULT_PACKAGE,
   Namespace,
   PackageDefinition,
   QualifiedName,
@@ -69,6 +71,15 @@ export class WorkspaceIndex {
   private rebuildPackageTables(): void {
     this.packagesByName = new Map();
     this.packageAliases = new Map();
+    // Seed standard package identities first so `CL`/`CL-USER`/`KEYWORD` resolve
+    // without any workspace `defpackage`. Workspace declarations are applied
+    // afterwards and win on any collision, so users may still redeclare them.
+    for (const builtin of BUILTIN_PACKAGES) {
+      this.packageAliases.set(builtin.name, builtin.name);
+      for (const nick of builtin.nicknames) {
+        this.packageAliases.set(nick, builtin.name);
+      }
+    }
     for (const { index } of this.entries.values()) {
       for (const pkg of index.packages) {
         this.packagesByName.set(pkg.name, pkg);
@@ -127,7 +138,7 @@ export class WorkspaceIndex {
   /** Resolves which (canonical) package is current at an offset in a document. */
   packageAt(uri: string, offset: number): string {
     const index = this.entries.get(uri)?.index;
-    if (!index) return "COMMON-LISP-USER";
+    if (!index) return DEFAULT_PACKAGE;
     return this.resolvePackageName(packageAtOffset(index, offset));
   }
 
@@ -138,6 +149,12 @@ export class WorkspaceIndex {
    * the reference position and the current (canonical) package. It never falls
    * back to an arbitrary same-named symbol from an unrelated package — a wrong
    * Go-to-Definition target is worse than none.
+   *
+   * Package qualification is enforced, not merely parsed:
+   *   - `pkg:foo`  (external) resolves only to a symbol *exported* from `pkg`;
+   *   - `pkg::foo` (internal) resolves to any symbol in `pkg`;
+   *   - `#:foo`    (uninterned) and `:foo` (keyword) have no global definition
+   *     to navigate to and never resolve.
    *
    * Within the resolved package + namespace:
    *   1. a generic function definition is preferred, if present (methods are its
@@ -154,6 +171,11 @@ export class WorkspaceIndex {
     options: ResolveOptions = {},
   ): SymbolDefinition[] {
     this.ensureFresh();
+    // An uninterned symbol has no package and no global identity; a keyword
+    // names itself. Neither can resolve to a workspace definition.
+    if (ref.qualification === "uninterned" || ref.qualification === "keyword") {
+      return [];
+    }
     const targetPackage = ref.packagePrefix
       ? this.resolvePackageName(ref.packagePrefix)
       : this.resolvePackageName(currentPackage);
@@ -164,7 +186,9 @@ export class WorkspaceIndex {
         s.scope === BindingScope.Global &&
         s.name === ref.name &&
         s.package === targetPackage &&
-        namespaceMatches(s.namespace, wanted),
+        namespaceMatches(s.namespace, wanted) &&
+        // A single-colon `pkg:foo` reference must name an exported symbol.
+        (ref.qualification !== "external" || s.exported === true),
     );
     if (inPackage.length === 0) return [];
 
