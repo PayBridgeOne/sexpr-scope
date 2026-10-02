@@ -11,6 +11,7 @@ import {
 } from "../model/symbol";
 import {
   ReferenceContext,
+  Reference,
   ReferenceOccurrence,
   collectReferences,
 } from "../model/reference";
@@ -38,8 +39,15 @@ import {
   ResolvedTarget,
   SemanticOccurrence,
   globalIdentityOf,
+  builtinIdentityOf,
 } from "../model/resolution";
 import { analyzeScopes } from "../analyzer/scope-analyzer";
+import {
+  standardSymbolKind,
+  standardSymbols,
+  StandardSymbolKind,
+  COMMON_LISP_PACKAGE,
+} from "../model/standard-library";
 import {
   SemanticTokenInfo,
   classifyToken,
@@ -95,6 +103,16 @@ export class WorkspaceIndex {
     new Map(),
   );
   private dirty = true;
+  /**
+   * Home package of every global definition, keyed by `uri\u0000offset` of its
+   * name token. A bare definition name (e.g. `(defun save-record …)`) does not
+   * necessarily intern a fresh symbol in the current package: Common Lisp reads
+   * the symbol before the definer runs, so if the name is already accessible by
+   * import, shadowing-import or inheritance it denotes that pre-existing symbol.
+   * This map records the resulting identity so a definition and every reference
+   * to it agree (Find References / Go to Definition across package identity).
+   */
+  private definitionHomes = new Map<string, string>();
 
   setDocument(uri: string, text: string): DocumentIndex {
     const doc = parseDocument(uri, text);
@@ -164,9 +182,10 @@ export class WorkspaceIndex {
       }
     }
 
-    // Build the accessibility model once the alias table is known. `definedNames`
-    // records the home package of every global definition; `exportedNames` is the
-    // union of each package's `:export` list and any definition flagged exported.
+    // Build the accessibility model once the alias table is known. `exportedNames`
+    // is the union of each package's `:export` list and any definition flagged
+    // exported; `definedNames` records the *home* package of every global
+    // definition, which is computed below with a circularity-free first pass.
     const definedNames = new Map<string, Set<string>>();
     const exportedNames = new Map<string, Set<string>>();
     const add = (map: Map<string, Set<string>>, pkg: string, name: string) => {
@@ -181,10 +200,35 @@ export class WorkspaceIndex {
       for (const sym of index.symbols) {
         if (sym.scope !== BindingScope.Global) continue;
         const canonical = this.packageAliases.get(sym.package) ?? sym.package;
-        add(definedNames, canonical, sym.name);
         const pkg = this.packagesByName.get(canonical);
         const exported = pkg ? pkg.exports.includes(sym.name) : sym.exported;
         if (exported) add(exportedNames, canonical, sym.name);
+      }
+    }
+
+    // First pass: a resolver with *empty* `definedNames` so the "defined
+    // directly" branch cannot fire. This lets us ask, for each raw definition
+    // name, whether its source spelling already refers to an imported,
+    // shadowing-imported, shadow or inherited symbol — i.e. its true home — the
+    // way Common Lisp's reader would, without the circular assumption that every
+    // unqualified definition interns a fresh symbol in the current package.
+    const firstPass = new PackageResolver(
+      this.packagesByName,
+      this.packageAliases,
+      new Map(),
+      exportedNames,
+    );
+    this.definitionHomes = new Map<string, string>();
+    for (const { index } of this.entries.values()) {
+      for (const sym of index.symbols) {
+        if (sym.scope !== BindingScope.Global) continue;
+        const canonical = this.packageAliases.get(sym.package) ?? sym.package;
+        const home = definitionHome(firstPass, canonical, sym.name);
+        add(definedNames, home, sym.name);
+        this.definitionHomes.set(
+          definitionKey(sym.uri, sym.selectionRange.start.offset),
+          home,
+        );
       }
     }
     this.packageResolver = new PackageResolver(
@@ -214,10 +258,22 @@ export class WorkspaceIndex {
   private normalize(sym: SymbolDefinition): SymbolDefinition {
     if (sym.scope === BindingScope.Lexical) return sym;
     const canonical = this.packageAliases.get(sym.package) ?? sym.package;
-    const pkg = this.packagesByName.get(canonical);
-    const exported = pkg ? pkg.exports.includes(sym.name) : sym.exported;
-    if (canonical === sym.package && exported === sym.exported) return sym;
-    return { ...sym, package: canonical, exported };
+    // Re-home the definition if its source name actually denotes a pre-existing
+    // imported / shadowing-imported / inherited symbol (computed in the package
+    // rebuild). The home determines both identity and export status so that a
+    // definition and every reference to it agree.
+    const home =
+      this.definitionHomes.get(
+        definitionKey(sym.uri, sym.selectionRange.start.offset),
+      ) ?? canonical;
+    const pkg = this.packagesByName.get(home);
+    const exported = pkg
+      ? pkg.exports.includes(sym.name)
+      : home === canonical
+        ? sym.exported
+        : this.packageResolver.exports(home, sym.name);
+    if (home === sym.package && exported === sym.exported) return sym;
+    return { ...sym, package: home, exported };
   }
 
   /** All (normalized) symbols across the workspace. */
@@ -471,6 +527,14 @@ export class WorkspaceIndex {
       };
     }
 
+    // A standardized COMMON-LISP symbol (mapcar, when, format, …) accessible in
+    // the current package. This stays conservative: it only fires for names in
+    // the static language catalog, and only where CL is actually accessible.
+    const builtin = this.builtinTarget(ref, namespace, currentPackage, targetPackage);
+    if (builtin) {
+      return { node, role: OccurrenceRole.Reference, target: builtin };
+    }
+
     // Well-formed but statically unknown: a stable identity still lets Find
     // References group equal uses, while Go to Definition yields no location.
     return {
@@ -484,6 +548,65 @@ export class WorkspaceIndex {
         package: targetPackage,
       },
     };
+  }
+
+  /**
+   * Resolves a reference to a standardized `COMMON-LISP` symbol, if it names one
+   * and `COMMON-LISP` is statically accessible from the reference's package. An
+   * unqualified symbol requires the current package to inherit `CL`; a
+   * `cl:`/`common-lisp:` qualifier names the standard package directly. The
+   * Lisp-2 namespace is respected: functions/macros/special operators only
+   * resolve in operator position, constants/variables only in value position.
+   */
+  private builtinTarget(
+    ref: Reference,
+    namespace: Namespace,
+    currentPackage: string,
+    targetPackage: string,
+  ): ResolvedTarget | undefined {
+    if (ref.packagePrefix) {
+      if (targetPackage !== COMMON_LISP_PACKAGE) return undefined;
+    } else if (!this.packageInheritsCommonLisp(currentPackage)) {
+      return undefined;
+    }
+    const kind = standardSymbolKind(ref.name);
+    if (!kind) return undefined;
+    // Type specifiers only appear in declaration/quoted positions, which the
+    // reference classifier does not distinguish; a bare value-position symbol is
+    // almost never a type reference, so types are resolved conservatively (not
+    // at all here) to avoid misclassifying ordinary variables like `condition`.
+    if (kind === "type") return undefined;
+    const callable =
+      kind === "function" || kind === "macro" || kind === "special-operator";
+    if (callable && namespace !== Namespace.Function) return undefined;
+    if (!callable && namespace !== Namespace.Value) return undefined;
+    return {
+      kind: "builtin",
+      identity: builtinIdentityOf(ref.name, namespace),
+      namespace,
+      name: ref.name,
+      package: COMMON_LISP_PACKAGE,
+      builtinKind: kind,
+    };
+  }
+
+  /**
+   * True when the standardized `COMMON-LISP` package is statically accessible
+   * from `canonicalPkg`: it is `CL`/`CL-USER`, or a workspace package whose
+   * `:use` list includes `COMMON-LISP`.
+   */
+  private packageInheritsCommonLisp(canonicalPkg: string): boolean {
+    if (
+      canonicalPkg === COMMON_LISP_PACKAGE ||
+      canonicalPkg === "COMMON-LISP-USER"
+    ) {
+      return true;
+    }
+    const def = this.packagesByName.get(canonicalPkg);
+    if (!def) return false;
+    return def.uses.some(
+      (u) => this.resolvePackageName(u) === COMMON_LISP_PACKAGE,
+    );
   }
 
   /** Classifies every occurrence in a document (shared by tokens/references). */
@@ -742,10 +865,60 @@ export class WorkspaceIndex {
       results.push(this.globalCandidate(sym, ctx, rank));
     }
 
+    // 3. Standardized COMMON-LISP symbols (mapcar, when, format, …) accessible
+    //    from here. These have no workspace definition but are valid completions;
+    //    a workspace symbol of the same name/namespace already shown wins.
+    const taken = new Set<string>(
+      results.map((c) => `${c.namespace}:${c.label.toUpperCase()}`),
+    );
+    this.addStandardCompletions(ctx, uri, offset, taken, results);
+
     results.sort(
       (a, b) => a.sortRank - b.sortRank || a.label.localeCompare(b.label),
     );
     return results.slice(0, 300);
+  }
+
+  /**
+   * Appends standardized `COMMON-LISP` symbols matching the completion context:
+   * the right Lisp-2 namespace, the typed prefix, and static `CL` accessibility
+   * (an unqualified token in a package that inherits `CL`, or a `cl:`/`cl::`
+   * qualified token). Names already produced by a workspace symbol are skipped.
+   */
+  private addStandardCompletions(
+    ctx: CompletionContext,
+    uri: string,
+    offset: number,
+    taken: Set<string>,
+    out: CompletionCandidate[],
+  ): void {
+    if (ctx.packagePrefix) {
+      if (this.resolvePackageName(ctx.packagePrefix) !== COMMON_LISP_PACKAGE) {
+        return;
+      }
+    } else if (!this.packageInheritsCommonLisp(this.packageAt(uri, offset))) {
+      return;
+    }
+    for (const { name, kind } of standardSymbols()) {
+      if (kind === "type") continue;
+      const namespace = builtinNamespace(kind);
+      if (namespace !== ctx.namespace) continue;
+      if (!name.startsWith(ctx.prefix)) continue;
+      const key = `${namespace}:${name}`;
+      if (taken.has(key)) continue;
+      taken.add(key);
+      const label = downcaseName(name);
+      out.push({
+        label,
+        insertText: label,
+        kind: completionKindOfStandard(kind),
+        namespace,
+        package: COMMON_LISP_PACKAGE,
+        detail: `${builtinKindText(kind)}  cl`,
+        sortRank: 4,
+        replaceRange: ctx.replaceRange,
+      });
+    }
   }
 
   private lexicalCandidate(
@@ -945,7 +1118,32 @@ export class WorkspaceIndex {
   }
 }
 
-/** Deterministic rank for an accessible global symbol by how it is accessed. */
+/** Stable key for a definition's name token (home-package lookup). */
+function definitionKey(uri: string, offset: number): string {
+  return `${uri}\u0000${offset}`;
+}
+
+/**
+ * Determines the home package of a global definition named `name` written in
+ * canonical package `currentPackage`, using a resolver whose `definedNames` is
+ * empty (so the "defined directly" branch never fires). If the source spelling
+ * is already accessible as an imported, shadowing-imported, shadow or inherited
+ * symbol, that symbol's home is returned; otherwise the definition interns a
+ * fresh symbol in the current package. Genuinely ambiguous names stay local
+ * rather than guessing.
+ */
+function definitionHome(
+  resolver: PackageResolver,
+  currentPackage: string,
+  name: string,
+): string {
+  const access = resolver.classify(currentPackage, name);
+  if (access.status === "present" || access.status === "inherited") {
+    return access.homePackage;
+  }
+  return currentPackage;
+}
+
 function rankForVia(via: string): number {
   switch (via) {
     case "definition":
@@ -1027,4 +1225,43 @@ function completionKindOfSymbol(kind: SymbolKind): CompletionKind {
 function namespaceMatches(ns: Namespace, wanted: ReferenceNamespace): boolean {
   if (wanted === "any") return true;
   return ns === wanted;
+}
+
+/** The Lisp-2 namespace a standardized symbol completes/resolves in. */
+function builtinNamespace(kind: StandardSymbolKind): Namespace {
+  switch (kind) {
+    case "function":
+    case "macro":
+    case "special-operator":
+      return Namespace.Function;
+    default:
+      return Namespace.Value;
+  }
+}
+
+/** Completion-item classification for a standardized symbol. */
+function completionKindOfStandard(kind: StandardSymbolKind): CompletionKind {
+  switch (kind) {
+    case "function":
+      return CompletionKind.Function;
+    case "macro":
+    case "special-operator":
+      return CompletionKind.Macro;
+    case "type":
+      return CompletionKind.Type;
+    case "constant":
+      return CompletionKind.Constant;
+    case "variable":
+      return CompletionKind.Variable;
+  }
+}
+
+/** Short human label for a standardized symbol's category. */
+function builtinKindText(kind: StandardSymbolKind): string {
+  switch (kind) {
+    case "special-operator":
+      return "special operator";
+    default:
+      return kind;
+  }
 }

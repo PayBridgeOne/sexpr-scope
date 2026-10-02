@@ -119,13 +119,17 @@ export function bindingFormKind(operator: string): BindingFormKind | undefined {
  * body: `defun`, `defmacro`, `defmethod`, `define-compiler-macro`. The name
  * itself is a *global* definition (indexed elsewhere); only its parameters are
  * lexical.
+ *
+ * `DEFGENERIC` is deliberately excluded: its lambda list describes the generic
+ * function's congruent signature, not an ordinary function body, so it
+ * establishes no lexical parameter bindings. Its lambda-list metadata is still
+ * captured by the document indexer for signature help and display.
  */
 const PARAMETERIZED_DEFINERS: ReadonlySet<string> = new Set([
   "DEFUN",
   "DEFMACRO",
   "DEFINE-COMPILER-MACRO",
   "DEFMETHOD",
-  "DEFGENERIC",
 ]);
 
 export function isParameterizedDefiner(operator: string): boolean {

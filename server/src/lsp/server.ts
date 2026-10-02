@@ -1,5 +1,7 @@
 import {
   Connection,
+  CompletionItem,
+  CompletionParams,
   DidChangeConfigurationNotification,
   DidChangeWatchedFilesParams,
   DocumentSymbol,
@@ -11,6 +13,8 @@ import {
   ReferenceParams,
   SemanticTokens,
   SemanticTokensParams,
+  SignatureHelp,
+  SignatureHelpParams,
   SymbolInformation,
   TextDocumentSyncKind,
   TextDocuments,
@@ -32,11 +36,15 @@ import {
   uriToFsPath,
 } from "./workspace-fs";
 import {
+  builtinHoverMarkdown,
   hoverMarkdown,
   kindLabel,
   lexicalHoverMarkdown,
+  toCompletionItem,
+  toLspDiagnostic,
   toLspRange,
   toLspSymbolKind,
+  toSignatureHelp,
 } from "./conversions";
 
 /** Handle returned by {@link createServer}, exposing the init readiness barrier. */
@@ -70,9 +78,24 @@ export function createServer(connection: Connection): ServerHandle {
     markReady = resolve;
   });
 
+  // Diagnostics are published for open editor buffers. Publishing waits until the
+  // initial scan settles so cross-file package information is available; after
+  // that, any buffer edit may change diagnostics in *other* open files (e.g. a
+  // changed `defpackage` export), so every open buffer is refreshed together.
+  let initialized = false;
+  const publishDiagnosticsFor = (uri: string): void => {
+    const diagnostics = index.diagnostics(uri).map(toLspDiagnostic);
+    connection.sendDiagnostics({ uri, diagnostics });
+  };
+  const publishAllOpen = (): void => {
+    if (!initialized) return;
+    for (const uri of openDocuments) publishDiagnosticsFor(uri);
+  };
+
   const reindexOpen = (doc: TextDocument) => {
     openDocuments.add(doc.uri);
     index.setDocument(doc.uri, doc.getText());
+    publishAllOpen();
   };
 
   const reindexFromDisk = (uri: string): Promise<void> =>
@@ -82,9 +105,12 @@ export function createServer(connection: Connection): ServerHandle {
   documents.onDidChangeContent((e) => reindexOpen(e.document));
   documents.onDidClose((e) => {
     // The buffer no longer overrides disk; fall back to the on-disk version so
-    // workspace-wide navigation stays consistent with what the user sees.
+    // workspace-wide navigation stays consistent with what the user sees. Clear
+    // the buffer's diagnostics (the editor no longer owns it) and refresh the
+    // rest, since this file's package forms may have affected them.
     openDocuments.delete(e.document.uri);
-    void reindexFromDisk(e.document.uri);
+    connection.sendDiagnostics({ uri: e.document.uri, diagnostics: [] });
+    void reindexFromDisk(e.document.uri).finally(() => publishAllOpen());
   });
 
   connection.onInitialize((params: InitializeParams): InitializeResult => {
@@ -93,7 +119,11 @@ export function createServer(connection: Connection): ServerHandle {
     // scan, so this always completes rather than blocking forever.
     scanWorkspace(index, params, openDocuments)
       .catch(() => undefined)
-      .finally(() => markReady());
+      .finally(() => {
+        initialized = true;
+        publishAllOpen();
+        markReady();
+      });
     return {
       capabilities: {
         textDocumentSync: TextDocumentSyncKind.Incremental,
@@ -102,6 +132,19 @@ export function createServer(connection: Connection): ServerHandle {
         definitionProvider: true,
         referencesProvider: true,
         hoverProvider: true,
+        completionProvider: {
+          // Package qualifier separators let the editor re-request completions
+          // after `:`/`::`; deliberately conservative (no alphabetic triggers).
+          triggerCharacters: [":"],
+          resolveProvider: false,
+        },
+        signatureHelpProvider: {
+          // Lisp has no argument separator punctuation, so signature help is
+          // driven by the opening paren and manual invocation, not noisy
+          // triggers. A space re-triggers as arguments are typed.
+          triggerCharacters: ["(", " "],
+          retriggerCharacters: [" "],
+        },
         semanticTokensProvider: {
           legend: {
             tokenTypes: [...TOKEN_TYPES],
@@ -132,6 +175,8 @@ export function createServer(connection: Connection): ServerHandle {
         void reindexFromDisk(uri);
       }
     }
+    // A disk-side package change can affect diagnostics in open buffers.
+    publishAllOpen();
   });
 
   connection.onDocumentSymbol(async (params): Promise<DocumentSymbol[]> => {
@@ -213,8 +258,47 @@ export function createServer(connection: Connection): ServerHandle {
         range,
       };
     }
+    if (target.kind === "builtin") {
+      return {
+        contents: { kind: "markdown", value: builtinHoverMarkdown(target) },
+        range,
+      };
+    }
     return null;
   });
+
+  connection.onCompletion(
+    async (params: CompletionParams): Promise<CompletionItem[]> => {
+      await ready;
+      const uri = params.textDocument.uri;
+      const doc = index.getDocument(uri);
+      if (!doc) return [];
+      const offset = offsetOf(
+        doc.text,
+        params.position.line,
+        params.position.character,
+      );
+      return index
+        .completions(uri, offset)
+        .map((candidate, i) => toCompletionItem(candidate, i));
+    },
+  );
+
+  connection.onSignatureHelp(
+    async (params: SignatureHelpParams): Promise<SignatureHelp | null> => {
+      await ready;
+      const uri = params.textDocument.uri;
+      const doc = index.getDocument(uri);
+      if (!doc) return null;
+      const offset = offsetOf(
+        doc.text,
+        params.position.line,
+        params.position.character,
+      );
+      const model = index.signatureHelp(uri, offset);
+      return model ? toSignatureHelp(model) : null;
+    },
+  );
 
   connection.languages.semanticTokens.on(
     async (params: SemanticTokensParams): Promise<SemanticTokens> => {

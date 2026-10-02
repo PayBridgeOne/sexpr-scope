@@ -328,19 +328,7 @@ function analyzeLocalFunctionBody(
   const fnScope = parent.newChild(clause.range);
   const clauseEnd = clause.range.end.offset;
   if (lambdaListNode && isList(lambdaListNode)) {
-    const vars = collectVariables(lambdaListNode, [], { destructuring: macro });
-    const scopeRange = rangeFrom(doc, lambdaListNode.range.start.offset, clauseEnd);
-    for (const v of vars) {
-      fnScope.addBinding(
-        makeBinding(
-          doc,
-          v.node,
-          Namespace.Value,
-          LexicalBindingKind.Parameter,
-          scopeRange,
-        ),
-      );
-    }
+    addLambdaListBindings(doc, lambdaListNode, fnScope, clauseEnd, macro);
   }
   for (let i = 2; i < clause.children.length; i++) {
     walk(doc, clause.children[i], fnScope, false);
@@ -356,19 +344,7 @@ function analyzeLambda(doc: Document, form: ListNode, parent: Scope): void {
   const scope = parent.newChild(form.range);
   const formEnd = form.range.end.offset;
   if (lambdaListNode && isList(lambdaListNode)) {
-    const vars = collectVariables(lambdaListNode, [], { destructuring: false });
-    const scopeRange = rangeFrom(doc, lambdaListNode.range.start.offset, formEnd);
-    for (const v of vars) {
-      scope.addBinding(
-        makeBinding(
-          doc,
-          v.node,
-          Namespace.Value,
-          LexicalBindingKind.Parameter,
-          scopeRange,
-        ),
-      );
-    }
+    addLambdaListBindings(doc, lambdaListNode, scope, formEnd, false);
     walkLambdaListDefaults(doc, lambdaListNode, scope);
   }
   for (let i = 2; i < form.children.length; i++) {
@@ -387,19 +363,7 @@ function analyzeDefiner(
   const formEnd = form.range.end.offset;
   const destructuring = op === "DEFMACRO" || op === "DEFINE-COMPILER-MACRO";
   if (lambdaListNode) {
-    const vars = collectVariables(lambdaListNode, [], { destructuring });
-    const scopeRange = rangeFrom(doc, lambdaListNode.range.start.offset, formEnd);
-    for (const v of vars) {
-      scope.addBinding(
-        makeBinding(
-          doc,
-          v.node,
-          Namespace.Value,
-          LexicalBindingKind.Parameter,
-          scopeRange,
-        ),
-      );
-    }
+    addLambdaListBindings(doc, lambdaListNode, scope, formEnd, destructuring);
     walkLambdaListDefaults(doc, lambdaListNode, scope);
   }
   // Walk the body (forms after the lambda list) for nested binding forms.
@@ -408,6 +372,37 @@ function analyzeDefiner(
     : 2;
   for (let i = startIndex; i < form.children.length; i++) {
     walk(doc, form.children[i], scope, false);
+  }
+}
+
+/**
+ * Adds one lexical binding per lambda-list variable, honoring Common Lisp's
+ * ordered (sequential, left-to-right) binding visibility: each parameter's
+ * scope begins at the end of its own specifier so init/default forms see only
+ * parameters to their left, never themselves or ones to their right. `&whole`
+ * and `&environment` variables are visible from the lambda-list start. The
+ * scope end is the enclosing form's end.
+ */
+function addLambdaListBindings(
+  doc: Document,
+  lambdaListNode: ListNode,
+  scope: Scope,
+  formEnd: number,
+  destructuring: boolean,
+): void {
+  const llStart = lambdaListNode.range.start.offset;
+  const vars = collectVariables(lambdaListNode, [], { destructuring });
+  for (const v of vars) {
+    const scopeStart = v.scopeStart ?? llStart;
+    scope.addBinding(
+      makeBinding(
+        doc,
+        v.node,
+        Namespace.Value,
+        LexicalBindingKind.Parameter,
+        rangeFrom(doc, scopeStart, formEnd),
+      ),
+    );
   }
 }
 

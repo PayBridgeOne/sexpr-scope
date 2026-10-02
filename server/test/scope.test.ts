@@ -242,3 +242,128 @@ test("the scope analyzer never treats quoted data as a binding form", () => {
   const scope = analyzeScopes(parseDocument(URI, text));
   assert.equal(scope.allBindings().length, 0);
 });
+
+// ---------------------------------------------------------------------------
+// Ordered lambda-list binding visibility (CLHS 3.4.1). Parameters are bound
+// sequentially, left to right: an init/default form sees parameters to its
+// left but never itself or ones to its right.
+// ---------------------------------------------------------------------------
+
+test("a required parameter is visible in a later &optional default form", () => {
+  const text = "(defun foo (required &optional (optional required)) optional)";
+  const idx = index(text);
+  // The `required` inside the optional default resolves to the required param.
+  const initRef = resolveNth(idx, text, "required", 1);
+  assert.equal(initRef?.kind, "lexical");
+  if (initRef?.kind === "lexical") {
+    assert.equal(initRef.binding.bindingKind, LexicalBindingKind.Parameter);
+    assert.equal(initRef.binding.selectionRange.start.offset, nth(text, "required", 0));
+  }
+});
+
+test("an earlier &optional parameter is visible in a later one's default", () => {
+  const text = "(defun foo (&optional (a 1) (b a)) (list a b))";
+  const idx = index(text);
+  // The `a` inside `(b a)` resolves to the first optional parameter.
+  const initRef = resolveNth(idx, text, "a", 1);
+  assert.equal(initRef?.kind, "lexical");
+  if (initRef?.kind === "lexical") {
+    assert.equal(initRef.binding.selectionRange.start.offset, nth(text, "a", 0));
+  }
+});
+
+test("an &optional init form does not see the parameter it is initializing", () => {
+  const text = "(let ((x 100))\n  (lambda (&optional (x x))\n    x))";
+  const idx = index(text);
+  // Tokens: x#0 = let var, x#1 = param decl, x#2 = init form, x#3 = body.
+  // The init `x` must refer to the OUTER let binding, not the param.
+  const initRef = resolveNth(idx, text, "x", 2);
+  assert.equal(initRef?.kind, "lexical");
+  if (initRef?.kind === "lexical") {
+    assert.equal(initRef.binding.bindingKind, LexicalBindingKind.LetVariable);
+    assert.equal(initRef.binding.selectionRange.start.offset, nth(text, "x", 0));
+  }
+  // After the parameter is established, the body `x` is the param.
+  const bodyRef = resolveNth(idx, text, "x", 3);
+  assert.equal(bodyRef?.kind, "lexical");
+  if (bodyRef?.kind === "lexical") {
+    assert.equal(bodyRef.binding.bindingKind, LexicalBindingKind.Parameter);
+    assert.equal(bodyRef.binding.selectionRange.start.offset, nth(text, "x", 1));
+  }
+});
+
+test("a supplied-p variable is visible in later forms but not its own spec", () => {
+  const text = "(defun foo (&optional (value 1 value-p) (other value-p)) (list value-p other))";
+  const idx = index(text);
+  // `value-p` referenced from a later parameter default resolves to the param.
+  const laterRef = resolveNth(idx, text, "value-p", 1);
+  assert.equal(laterRef?.kind, "lexical");
+  if (laterRef?.kind === "lexical") {
+    assert.equal(laterRef.binding.selectionRange.start.offset, nth(text, "value-p", 0));
+  }
+  // And from the body.
+  const bodyRef = resolveNth(idx, text, "value-p", 2);
+  assert.equal(bodyRef?.kind, "lexical");
+});
+
+test("an earlier parameter is visible in a later &key default form", () => {
+  const text = "(defun foo (a &key (b a)) (list a b))";
+  const idx = index(text);
+  const initRef = resolveNth(idx, text, "a", 1); // the `a` inside `(b a)`
+  assert.equal(initRef?.kind, "lexical");
+  if (initRef?.kind === "lexical") {
+    assert.equal(initRef.binding.selectionRange.start.offset, nth(text, "a", 0));
+  }
+});
+
+test("a &rest variable is visible in a later &key default form", () => {
+  const text = "(defun foo (&rest args &key (first (car args))) (list args first))";
+  const idx = index(text);
+  const initRef = resolveNth(idx, text, "args", 1); // `args` inside the key default
+  assert.equal(initRef?.kind, "lexical");
+  if (initRef?.kind === "lexical") {
+    assert.equal(initRef.binding.selectionRange.start.offset, nth(text, "args", 0));
+  }
+});
+
+test("&aux variables bind sequentially (LET*-like)", () => {
+  const text = "(defun foo (&aux (a 1) (b a)) (list a b))";
+  const idx = index(text);
+  // `a` inside `(b a)` resolves to the first &aux variable.
+  const initRef = resolveNth(idx, text, "a", 1);
+  assert.equal(initRef?.kind, "lexical");
+  if (initRef?.kind === "lexical") {
+    assert.equal(initRef.binding.selectionRange.start.offset, nth(text, "a", 0));
+  }
+});
+
+test("an &aux variable does not resolve to its own not-yet-established binding", () => {
+  const text = "(let ((a 100))\n  (lambda (&aux (a a))\n    a))";
+  const idx = index(text);
+  // Tokens: a#0 = let var, a#1 = aux decl, a#2 = init form, a#3 = body.
+  // The init `a` refers to the outer let binding, not the &aux variable.
+  const initRef = resolveNth(idx, text, "a", 2);
+  assert.equal(initRef?.kind, "lexical");
+  if (initRef?.kind === "lexical") {
+    assert.equal(initRef.binding.bindingKind, LexicalBindingKind.LetVariable);
+    assert.equal(initRef.binding.selectionRange.start.offset, nth(text, "a", 0));
+  }
+  // The body `a` resolves to the &aux variable.
+  const bodyRef = resolveNth(idx, text, "a", 3);
+  assert.equal(bodyRef?.kind, "lexical");
+  if (bodyRef?.kind === "lexical") {
+    assert.equal(bodyRef.binding.selectionRange.start.offset, nth(text, "a", 1));
+  }
+});
+
+test("DEFGENERIC parameters do not create lexical body bindings", () => {
+  // A defgeneric lambda list describes a congruent signature, not a function
+  // body, so its parameters must not become lexical bindings.
+  const text = "(defgeneric area (shape))";
+  const scope = analyzeScopes(parseDocument(URI, text));
+  assert.equal(
+    scope.allBindings().some((b) => b.name === "SHAPE"),
+    false,
+    "defgeneric parameter must not be a lexical binding",
+  );
+});

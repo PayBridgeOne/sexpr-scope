@@ -2,6 +2,7 @@ import { Range } from "../parser/position";
 import { AtomNode } from "../parser/reader";
 import { LexicalBinding } from "./scope";
 import { Namespace, SymbolDefinition } from "./symbol";
+import { StandardSymbolKind } from "./standard-library";
 
 /**
  * The semantic target a reference resolves to.
@@ -43,6 +44,21 @@ export type ResolvedTarget =
       readonly name: string;
       readonly package: string;
     }
+  | {
+      /**
+       * A standardized `COMMON-LISP` symbol known from the static language
+       * catalog (e.g. `mapcar`, `when`, `format`). It carries a stable identity
+       * so Find References groups uses and semantic tokens / hover can classify
+       * it, but it has no workspace definition: Go to Definition yields no
+       * location (the standard library has no source file here).
+       */
+      readonly kind: "builtin";
+      readonly identity: string;
+      readonly namespace: Namespace;
+      readonly name: string;
+      readonly package: string;
+      readonly builtinKind: StandardSymbolKind;
+    }
   | { readonly kind: "none" };
 
 /** Whether an occurrence introduces a binding or refers to one. */
@@ -83,4 +99,9 @@ export function globalIdentityOf(
   namespace: Namespace,
 ): string {
   return `global:${pkg}:${name}:${namespace}`;
+}
+
+/** Builds the identity string for a standard-library (builtin) symbol. */
+export function builtinIdentityOf(name: string, namespace: Namespace): string {
+  return `builtin:COMMON-LISP:${name}:${namespace}`;
 }

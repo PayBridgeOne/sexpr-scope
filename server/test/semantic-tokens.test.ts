@@ -138,3 +138,46 @@ test("encodeSemanticTokens produces 5-tuples with non-negative deltas", () => {
     assert.ok(data[i + 2] > 0, "length positive");
   }
 });
+
+const STDLIB = [
+  "(in-package :cl-user)",
+  "(if condition",
+  '    (format t "yes")',
+  "    (when fallback",
+  "      (mapcar #'identity values)))",
+].join("\n");
+
+test("semantic tokens recognize standard COMMON-LISP operators", () => {
+  const tokens = tokensFor(STDLIB);
+  // IF is a special operator (central language knowledge), read as a keyword.
+  assertToken(tokens, STDLIB, "if", 0, "keyword");
+  // FORMAT / MAPCAR / IDENTITY are standard functions from the static catalog.
+  assertToken(tokens, STDLIB, "format", 0, "function", ["defaultLibrary"]);
+  assertToken(tokens, STDLIB, "mapcar", 0, "function", ["defaultLibrary"]);
+  assertToken(tokens, STDLIB, "identity", 0, "function", ["defaultLibrary"]);
+  // WHEN is a standard macro, not merely an unresolved function-position symbol.
+  assertToken(tokens, STDLIB, "when", 0, "macro", ["defaultLibrary"]);
+});
+
+test("a standard function is not claimed in value position", () => {
+  // `list` is a standard function; as a bare value-position symbol it must not be
+  // classified as a builtin (Lisp-2 namespace), staying a plain variable.
+  const text = "(in-package :cl-user)\n(defun r (x) (vector list))";
+  const tokens = tokensFor(text);
+  const tok = at(tokens, offsetOf(text, "list", 0));
+  assert.equal(tok.type, "variable");
+  assert.ok(!tok.modifiers.includes("defaultLibrary"));
+});
+
+test("a user definition shadows standard-library classification", () => {
+  // Defining `mapcar` in the workspace makes the reference resolve to the user's
+  // definition, not the standard catalog entry.
+  const text = [
+    "(in-package :cl-user)",
+    "(defun mapcar (f xs) xs)",
+    "(defun r (f xs) (mapcar f xs))",
+  ].join("\n");
+  const tokens = tokensFor(text);
+  const tok = at(tokens, offsetOf(text, "mapcar", 1));
+  assert.ok(!tok.modifiers.includes("defaultLibrary"));
+});

@@ -208,3 +208,140 @@ test("package nicknames are honored in :use and :import-from", () => {
   assert.equal(defs.length, 1);
   assert.equal(defs[0].package, "DATABASE");
 });
+
+// ---------------------------------------------------------------------------
+// Package-aware *definition* identity. A bare definition name denotes a symbol
+// the reader already resolved, so a definition and all references to it must
+// share one identity even across packages (CLHS symbol resolution precedes the
+// definer's effect).
+// ---------------------------------------------------------------------------
+
+/** Offset of the name token in the first `(defun <name>` form of a document. */
+function defunNameOffset(text: string, name: string): number {
+  const i = text.indexOf("(defun " + name);
+  if (i === -1) throw new Error(`defun ${name} not found`);
+  return i + "(defun ".length;
+}
+
+function targetOf(idx: WorkspaceIndex, uri: string, offset: number) {
+  const r = idx.resolveAt(uri, offset + 1);
+  return r?.target;
+}
+
+test("defun of an imported symbol is homed in the exporting package", () => {
+  const idx = new WorkspaceIndex();
+  idx.setDocument(
+    "file:///db.lisp",
+    "(defpackage :database (:use :cl) (:export #:save-record))\n" +
+      "(in-package :database)\n(defun save-record (x) x)",
+  );
+  const appText =
+    "(defpackage :app (:use :cl) (:import-from :database #:save-record))\n" +
+    "(in-package :app)\n(defun save-record (y) y)";
+  idx.setDocument("file:///app.lisp", appText);
+
+  const t = targetOf(idx, "file:///app.lisp", defunNameOffset(appText, "save-record"));
+  assert.equal(t?.kind, "global");
+  if (t?.kind === "global") {
+    assert.equal(t.package, "DATABASE");
+  }
+});
+
+test("defun of a shadowing-imported symbol preserves the imported home", () => {
+  const idx = new WorkspaceIndex();
+  idx.setDocument(
+    "file:///db.lisp",
+    "(defpackage :database (:use :cl) (:export #:save-record))\n" +
+      "(in-package :database)\n(defun save-record (x) x)",
+  );
+  const appText =
+    "(defpackage :app (:use :cl) (:shadowing-import-from :database #:save-record))\n" +
+    "(in-package :app)\n(defun save-record (y) y)";
+  idx.setDocument("file:///app.lisp", appText);
+
+  const t = targetOf(idx, "file:///app.lisp", defunNameOffset(appText, "save-record"));
+  assert.equal(t?.kind, "global");
+  if (t?.kind === "global") {
+    assert.equal(t.package, "DATABASE");
+  }
+});
+
+test("defun of an inherited symbol is homed in the used package", () => {
+  const idx = new WorkspaceIndex();
+  idx.setDocument(
+    "file:///shared.lisp",
+    "(defpackage :shared (:use :cl) (:export #:process))\n" +
+      "(in-package :shared)\n(defun process (x) x)",
+  );
+  const appText =
+    "(defpackage :app (:use :cl :shared))\n" +
+    "(in-package :app)\n(defun process (y) y)";
+  idx.setDocument("file:///app.lisp", appText);
+
+  const t = targetOf(idx, "file:///app.lisp", defunNameOffset(appText, "process"));
+  assert.equal(t?.kind, "global");
+  if (t?.kind === "global") {
+    assert.equal(t.package, "SHARED");
+  }
+});
+
+test("defun after :shadow creates a local identity in the shadowing package", () => {
+  const idx = new WorkspaceIndex();
+  idx.setDocument(
+    "file:///shared.lisp",
+    "(defpackage :shared (:use :cl) (:export #:process))\n" +
+      "(in-package :shared)\n(defun process (x) x)",
+  );
+  const appText =
+    "(defpackage :app (:use :cl :shared) (:shadow #:process))\n" +
+    "(in-package :app)\n(defun process (y) y)";
+  idx.setDocument("file:///app.lisp", appText);
+
+  const t = targetOf(idx, "file:///app.lisp", defunNameOffset(appText, "process"));
+  assert.equal(t?.kind, "global");
+  if (t?.kind === "global") {
+    assert.equal(t.package, "APP");
+  }
+});
+
+test("Find References spans imported definition identity across packages", () => {
+  const idx = new WorkspaceIndex();
+  const dbText =
+    "(defpackage :database (:use :cl) (:export #:save-record))\n" +
+    "(in-package :database)\n(defun save-record (x) x)\n(save-record 1)";
+  idx.setDocument("file:///db.lisp", dbText);
+  const appText =
+    "(defpackage :app (:use :cl) (:import-from :database #:save-record))\n" +
+    "(in-package :app)\n(save-record 2)";
+  idx.setDocument("file:///app.lisp", appText);
+
+  // From the use site in APP, references must include the DATABASE definition
+  // and both call sites — one identity across the imported boundary.
+  const useOffset = appText.lastIndexOf("save-record");
+  const refs = idx.findReferences("file:///app.lisp", useOffset + 1, true);
+  const uris = refs.map((r) => r.uri).sort();
+  assert.ok(refs.length >= 3, `expected >=3 references, got ${refs.length}`);
+  assert.ok(uris.includes("file:///db.lisp"));
+  assert.ok(uris.includes("file:///app.lisp"));
+});
+
+test("Go to Definition across imported identity lands on the exporting defun", () => {
+  const idx = new WorkspaceIndex();
+  const dbText =
+    "(defpackage :database (:use :cl) (:export #:save-record))\n" +
+    "(in-package :database)\n(defun save-record (x) x)";
+  idx.setDocument("file:///db.lisp", dbText);
+  const appText =
+    "(defpackage :app (:use :cl) (:import-from :database #:save-record))\n" +
+    "(in-package :app)\n(save-record 2)";
+  idx.setDocument("file:///app.lisp", appText);
+
+  const useOffset = appText.lastIndexOf("save-record");
+  const t = targetOf(idx, "file:///app.lisp", useOffset);
+  assert.equal(t?.kind, "global");
+  if (t?.kind === "global") {
+    assert.equal(t.package, "DATABASE");
+    assert.equal(t.symbols.length, 1);
+    assert.equal(t.symbols[0].uri, "file:///db.lisp");
+  }
+});
