@@ -53,10 +53,20 @@ function operatorName(node: SyntaxNode | undefined): string | undefined {
   return undefined;
 }
 
+/** A classified reference together with the atom node it occupies. */
+export interface ReferenceOccurrence {
+  readonly node: AtomNode;
+  readonly reference: Reference;
+}
+
+type Emit = (node: AtomNode, reference: Reference) => void;
+
 /**
- * Classifies the reference at `offset`, returning its print name, package
- * qualification and Lisp-2 context. Returns `undefined` when no symbol sits
- * under the offset.
+ * Visits every symbol occurrence in a document, classifying each by its Lisp-2
+ * context. This is the single traversal shared by {@link referenceAt} (which
+ * filters to the occurrence under a cursor) and {@link collectReferences} (which
+ * returns every occurrence for Find References and semantic tokens), so the
+ * classification logic is never duplicated.
  *
  * The traversal tracks whether a position is evaluated as a function, as a
  * value, or is inert quoted data:
@@ -65,24 +75,18 @@ function operatorName(node: SyntaxNode | undefined): string | undefined {
  *  - `'`/`` ` ``-quoted data (and `(quote …)` arguments) are data, except that
  *    `,`/`,@` unquotes re-enter evaluation inside a quasiquote.
  */
-export function referenceAt(doc: Document, offset: number): Reference | undefined {
-  let found: Reference | undefined;
-
-  const within = (node: SyntaxNode): boolean =>
-    offset >= node.range.start.offset && offset <= node.range.end.offset;
-
+export function forEachReference(doc: Document, emit: Emit): void {
   const recordAtom = (node: AtomNode, ctx: Ctx): void => {
     const q = parseQualifiedName(node.text);
-    found = {
+    emit(node, {
       name: q.name,
       packagePrefix: q.packagePrefix,
       qualification: q.qualification,
       context: toContext(ctx),
-    };
+    });
   };
 
   const visit = (node: SyntaxNode, ctx: Ctx): void => {
-    if (!within(node)) return;
     switch (node.kind) {
       case NodeKind.Atom:
         recordAtom(node, ctx);
@@ -140,14 +144,15 @@ export function referenceAt(doc: Document, offset: number): Reference | undefine
           // `(setf place)` in a function-designator position names (SETF PLACE).
           visit(children[0], "function");
           const target = stripPrefixes(children[1]);
-          if (target && target.kind === NodeKind.Atom && within(target)) {
+          if (target && target.kind === NodeKind.Atom) {
             const q = parseQualifiedName(target.text);
-            found = {
+            emit(target, {
               name: `(SETF ${q.name})`,
               packagePrefix: q.packagePrefix,
               qualification: q.qualification,
               context: ReferenceContext.Function,
-            };
+            });
+            for (let i = 2; i < children.length; i++) visit(children[i], "value");
             return;
           }
           for (let i = 1; i < children.length; i++) visit(children[i], "value");
@@ -163,7 +168,36 @@ export function referenceAt(doc: Document, offset: number): Reference | undefine
   };
 
   for (const root of doc.roots) visit(root, "value");
+}
+
+/** Every classified symbol occurrence in a document, in source order. */
+export function collectReferences(doc: Document): ReferenceOccurrence[] {
+  const out: ReferenceOccurrence[] = [];
+  forEachReference(doc, (node, reference) => out.push({ node, reference }));
+  return out;
+}
+
+/** The occurrence (atom + classified reference) under `offset`, if any. */
+export function referenceOccurrenceAt(
+  doc: Document,
+  offset: number,
+): ReferenceOccurrence | undefined {
+  let found: ReferenceOccurrence | undefined;
+  forEachReference(doc, (node, reference) => {
+    if (offset >= node.range.start.offset && offset <= node.range.end.offset) {
+      found = { node, reference };
+    }
+  });
   return found;
+}
+
+/**
+ * Classifies the reference at `offset`, returning its print name, package
+ * qualification and Lisp-2 context. Returns `undefined` when no symbol sits
+ * under the offset.
+ */
+export function referenceAt(doc: Document, offset: number): Reference | undefined {
+  return referenceOccurrenceAt(doc, offset)?.reference;
 }
 
 /** Convenience wrapper returning only the Lisp-2 context at `offset`. */

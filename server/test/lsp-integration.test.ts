@@ -19,6 +19,8 @@ import {
   ShutdownRequest,
   DidOpenTextDocumentNotification,
   DefinitionRequest,
+  ReferencesRequest,
+  SemanticTokensRequest,
   Location,
 } from "vscode-languageserver-protocol/node";
 import { createServer } from "../src/lsp/server";
@@ -103,6 +105,194 @@ test("LSP server resolves Go to Definition into an unopened workspace file", asy
     // Graceful shutdown. We intentionally do not send `exit`, which would let
     // the server terminate the process; disposing the pipes is enough to free
     // every handle so the test runner exits naturally.
+    await client.sendRequest(ShutdownRequest.type, undefined);
+  } finally {
+    client.dispose();
+    serverConnection.dispose();
+    clientToServer.destroy();
+    serverToClient.destroy();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Exercises `textDocument/references` across the real LSP boundary: a global
+ * function defined in one on-disk file and called from an opened document. The
+ * request must return the cross-file declaration plus the in-document call, and
+ * honor `includeDeclaration`.
+ */
+test("LSP server returns cross-file references and honors includeDeclaration", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sexpr-scope-refs-"));
+
+  const libPath = path.join(dir, "lib.lisp");
+  await fs.writeFile(
+    libPath,
+    "(in-package :cl-user)\n(defun shared-op () 1)\n",
+    "utf8",
+  );
+
+  const mainPath = path.join(dir, "main.lisp");
+  const mainText = "(in-package :cl-user)\n(shared-op)\n(list (shared-op))\n";
+  await fs.writeFile(mainPath, mainText, "utf8");
+
+  const clientToServer = new PassThrough();
+  const serverToClient = new PassThrough();
+
+  const serverConnection = createConnection(
+    new ServerReader(clientToServer),
+    new ServerWriter(serverToClient),
+  );
+  createServer(serverConnection);
+
+  const client = createProtocolConnection(
+    new StreamMessageReader(serverToClient),
+    new StreamMessageWriter(clientToServer),
+  );
+  client.listen();
+
+  try {
+    await client.sendRequest(InitializeRequest.type, {
+      processId: null,
+      rootUri: pathToFileURL(dir).toString(),
+      capabilities: {},
+      workspaceFolders: [
+        { uri: pathToFileURL(dir).toString(), name: "sexpr-scope-fixture" },
+      ],
+    });
+    client.sendNotification(InitializedNotification.type, {});
+
+    const mainUri = pathToFileURL(mainPath).toString();
+    client.sendNotification(DidOpenTextDocumentNotification.type, {
+      textDocument: { uri: mainUri, languageId: "lisp", version: 1, text: mainText },
+    });
+
+    // Position over the first `(shared-op)` call in the opened document.
+    const withDecl = (await client.sendRequest(ReferencesRequest.type, {
+      textDocument: { uri: mainUri },
+      position: { line: 1, character: 3 },
+      context: { includeDeclaration: true },
+    })) as Location[];
+
+    // One declaration (lib) + two calls (main).
+    assert.equal(withDecl.length, 3);
+    const libUri = pathToFileURL(libPath).toString();
+    assert.ok(
+      withDecl.some((l) => l.uri === libUri),
+      "declaration file must appear in references",
+    );
+    assert.equal(
+      withDecl.filter((l) => l.uri === mainUri).length,
+      2,
+      "both call sites must appear",
+    );
+
+    const withoutDecl = (await client.sendRequest(ReferencesRequest.type, {
+      textDocument: { uri: mainUri },
+      position: { line: 1, character: 3 },
+      context: { includeDeclaration: false },
+    })) as Location[];
+
+    // Declaration excluded: only the two call sites remain.
+    assert.equal(withoutDecl.length, 2);
+    assert.ok(
+      withoutDecl.every((l) => l.uri === mainUri),
+      "only in-document calls remain when the declaration is excluded",
+    );
+
+    await client.sendRequest(ShutdownRequest.type, undefined);
+  } finally {
+    client.dispose();
+    serverConnection.dispose();
+    clientToServer.destroy();
+    serverToClient.destroy();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("LSP server returns decoded semantic tokens for an opened document", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sexpr-scope-tok-"));
+
+  const mainPath = path.join(dir, "main.lisp");
+  const mainText =
+    "(in-package :cl-user)\n(defun calculate (amount)\n  (let ((result amount))\n    result))\n";
+  await fs.writeFile(mainPath, mainText, "utf8");
+
+  const clientToServer = new PassThrough();
+  const serverToClient = new PassThrough();
+
+  const serverConnection = createConnection(
+    new ServerReader(clientToServer),
+    new ServerWriter(serverToClient),
+  );
+  createServer(serverConnection);
+
+  const client = createProtocolConnection(
+    new StreamMessageReader(serverToClient),
+    new StreamMessageWriter(clientToServer),
+  );
+  client.listen();
+
+  try {
+    const init = (await client.sendRequest(InitializeRequest.type, {
+      processId: null,
+      rootUri: pathToFileURL(dir).toString(),
+      capabilities: {},
+      workspaceFolders: [
+        { uri: pathToFileURL(dir).toString(), name: "sexpr-scope-fixture" },
+      ],
+    })) as {
+      capabilities: {
+        semanticTokensProvider?: { legend: { tokenTypes: string[] } };
+      };
+    };
+    client.sendNotification(InitializedNotification.type, {});
+
+    // The capability is advertised with its legend.
+    const legend = init.capabilities.semanticTokensProvider?.legend;
+    assert.ok(legend, "semanticTokensProvider must be advertised");
+    assert.ok(legend!.tokenTypes.includes("function"));
+    assert.ok(legend!.tokenTypes.includes("parameter"));
+
+    const mainUri = pathToFileURL(mainPath).toString();
+    client.sendNotification(DidOpenTextDocumentNotification.type, {
+      textDocument: { uri: mainUri, languageId: "lisp", version: 1, text: mainText },
+    });
+
+    const result = (await client.sendRequest(SemanticTokensRequest.type, {
+      textDocument: { uri: mainUri },
+    })) as { data: number[] };
+
+    assert.ok(result && Array.isArray(result.data), "data array returned");
+    assert.ok(result.data.length > 0, "at least one token");
+    assert.equal(result.data.length % 5, 0, "5-tuples");
+
+    // Decode absolute positions and map each token's type index back through the
+    // advertised legend, then check specific classifications.
+    const types = legend!.tokenTypes;
+    let line = 0;
+    let char = 0;
+    const decoded: { line: number; char: number; type: string }[] = [];
+    for (let i = 0; i < result.data.length; i += 5) {
+      const dLine = result.data[i];
+      const dChar = result.data[i + 1];
+      if (dLine === 0) char += dChar;
+      else {
+        line += dLine;
+        char = dChar;
+      }
+      decoded.push({ line, char, type: types[result.data[i + 3]] });
+    }
+
+    // `calculate` at line 1, char 7 is a function.
+    const calc = decoded.find((d) => d.line === 1 && d.char === 7);
+    assert.ok(calc, "token at the defun name");
+    assert.equal(calc!.type, "function");
+
+    // `amount` parameter at line 1, char 18.
+    const amount = decoded.find((d) => d.line === 1 && d.char === 18);
+    assert.ok(amount, "token at the parameter");
+    assert.equal(amount!.type, "parameter");
+
     await client.sendRequest(ShutdownRequest.type, undefined);
   } finally {
     client.dispose();

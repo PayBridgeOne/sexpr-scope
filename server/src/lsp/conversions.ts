@@ -4,6 +4,7 @@ import {
 } from "vscode-languageserver";
 import { Range } from "../parser/position";
 import { SymbolDefinition, SymbolKind } from "../model/symbol";
+import { LexicalBinding, LexicalBindingKind } from "../model/scope";
 
 export function toLspRange(range: Range): LspRange {
   return {
@@ -77,5 +78,44 @@ export function hoverMarkdown(sym: SymbolDefinition): string {
     lines.push("");
     lines.push(sym.documentation);
   }
+  return lines.join("\n");
+}
+
+/** Human-readable label for a lexical binding kind. */
+export function lexicalKindLabel(kind: LexicalBindingKind): string {
+  switch (kind) {
+    case LexicalBindingKind.Parameter:
+      return "parameter";
+    case LexicalBindingKind.LetVariable:
+      return "lexical variable";
+    case LexicalBindingKind.LocalFunction:
+      return "local function";
+    case LexicalBindingKind.LocalMacro:
+      return "local macro";
+    case LexicalBindingKind.SymbolMacro:
+      return "symbol macro";
+    case LexicalBindingKind.MultipleValue:
+      return "lexical variable";
+    case LexicalBindingKind.Destructuring:
+      return "lexical variable";
+  }
+}
+
+/** Builds a Markdown hover body for a lexical binding. */
+export function lexicalHoverMarkdown(binding: LexicalBinding): string {
+  const lines: string[] = [];
+  const isLocalFn =
+    binding.bindingKind === LexicalBindingKind.LocalFunction ||
+    binding.bindingKind === LexicalBindingKind.LocalMacro;
+  lines.push("```lisp");
+  // A local function/macro reads as a call form; a variable is just its name.
+  lines.push(
+    isLocalFn
+      ? `(${binding.name}${binding.lambdaList ? ` ${binding.lambdaList}` : ""})`
+      : binding.name,
+  );
+  lines.push("```");
+  // Lexical bindings are not package-owned; say so plainly.
+  lines.push(`*${lexicalKindLabel(binding.bindingKind)} (lexical)*`);
   return lines.join("\n");
 }
