@@ -95,6 +95,16 @@ export class WorkspaceIndex {
     new Map(),
   );
   private dirty = true;
+  /**
+   * Home package of every global definition, keyed by `uri\u0000offset` of its
+   * name token. A bare definition name (e.g. `(defun save-record …)`) does not
+   * necessarily intern a fresh symbol in the current package: Common Lisp reads
+   * the symbol before the definer runs, so if the name is already accessible by
+   * import, shadowing-import or inheritance it denotes that pre-existing symbol.
+   * This map records the resulting identity so a definition and every reference
+   * to it agree (Find References / Go to Definition across package identity).
+   */
+  private definitionHomes = new Map<string, string>();
 
   setDocument(uri: string, text: string): DocumentIndex {
     const doc = parseDocument(uri, text);
@@ -164,9 +174,10 @@ export class WorkspaceIndex {
       }
     }
 
-    // Build the accessibility model once the alias table is known. `definedNames`
-    // records the home package of every global definition; `exportedNames` is the
-    // union of each package's `:export` list and any definition flagged exported.
+    // Build the accessibility model once the alias table is known. `exportedNames`
+    // is the union of each package's `:export` list and any definition flagged
+    // exported; `definedNames` records the *home* package of every global
+    // definition, which is computed below with a circularity-free first pass.
     const definedNames = new Map<string, Set<string>>();
     const exportedNames = new Map<string, Set<string>>();
     const add = (map: Map<string, Set<string>>, pkg: string, name: string) => {
@@ -181,10 +192,35 @@ export class WorkspaceIndex {
       for (const sym of index.symbols) {
         if (sym.scope !== BindingScope.Global) continue;
         const canonical = this.packageAliases.get(sym.package) ?? sym.package;
-        add(definedNames, canonical, sym.name);
         const pkg = this.packagesByName.get(canonical);
         const exported = pkg ? pkg.exports.includes(sym.name) : sym.exported;
         if (exported) add(exportedNames, canonical, sym.name);
+      }
+    }
+
+    // First pass: a resolver with *empty* `definedNames` so the "defined
+    // directly" branch cannot fire. This lets us ask, for each raw definition
+    // name, whether its source spelling already refers to an imported,
+    // shadowing-imported, shadow or inherited symbol — i.e. its true home — the
+    // way Common Lisp's reader would, without the circular assumption that every
+    // unqualified definition interns a fresh symbol in the current package.
+    const firstPass = new PackageResolver(
+      this.packagesByName,
+      this.packageAliases,
+      new Map(),
+      exportedNames,
+    );
+    this.definitionHomes = new Map<string, string>();
+    for (const { index } of this.entries.values()) {
+      for (const sym of index.symbols) {
+        if (sym.scope !== BindingScope.Global) continue;
+        const canonical = this.packageAliases.get(sym.package) ?? sym.package;
+        const home = definitionHome(firstPass, canonical, sym.name);
+        add(definedNames, home, sym.name);
+        this.definitionHomes.set(
+          definitionKey(sym.uri, sym.selectionRange.start.offset),
+          home,
+        );
       }
     }
     this.packageResolver = new PackageResolver(
@@ -214,10 +250,22 @@ export class WorkspaceIndex {
   private normalize(sym: SymbolDefinition): SymbolDefinition {
     if (sym.scope === BindingScope.Lexical) return sym;
     const canonical = this.packageAliases.get(sym.package) ?? sym.package;
-    const pkg = this.packagesByName.get(canonical);
-    const exported = pkg ? pkg.exports.includes(sym.name) : sym.exported;
-    if (canonical === sym.package && exported === sym.exported) return sym;
-    return { ...sym, package: canonical, exported };
+    // Re-home the definition if its source name actually denotes a pre-existing
+    // imported / shadowing-imported / inherited symbol (computed in the package
+    // rebuild). The home determines both identity and export status so that a
+    // definition and every reference to it agree.
+    const home =
+      this.definitionHomes.get(
+        definitionKey(sym.uri, sym.selectionRange.start.offset),
+      ) ?? canonical;
+    const pkg = this.packagesByName.get(home);
+    const exported = pkg
+      ? pkg.exports.includes(sym.name)
+      : home === canonical
+        ? sym.exported
+        : this.packageResolver.exports(home, sym.name);
+    if (home === sym.package && exported === sym.exported) return sym;
+    return { ...sym, package: home, exported };
   }
 
   /** All (normalized) symbols across the workspace. */
@@ -946,6 +994,32 @@ export class WorkspaceIndex {
 }
 
 /** Deterministic rank for an accessible global symbol by how it is accessed. */
+/** Stable key for a definition's name token (home-package lookup). */
+function definitionKey(uri: string, offset: number): string {
+  return `${uri}\u0000${offset}`;
+}
+
+/**
+ * Determines the home package of a global definition named `name` written in
+ * canonical package `currentPackage`, using a resolver whose `definedNames` is
+ * empty (so the "defined directly" branch never fires). If the source spelling
+ * is already accessible as an imported, shadowing-imported, shadow or inherited
+ * symbol, that symbol's home is returned; otherwise the definition interns a
+ * fresh symbol in the current package. Genuinely ambiguous names stay local
+ * rather than guessing.
+ */
+function definitionHome(
+  resolver: PackageResolver,
+  currentPackage: string,
+  name: string,
+): string {
+  const access = resolver.classify(currentPackage, name);
+  if (access.status === "present" || access.status === "inherited") {
+    return access.homePackage;
+  }
+  return currentPackage;
+}
+
 function rankForVia(via: string): number {
   switch (via) {
     case "definition":
