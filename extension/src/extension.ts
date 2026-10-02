@@ -7,6 +7,7 @@ import {
   TransportKind,
 } from "vscode-languageclient/node";
 import { LispStructureProvider } from "./lispStructure";
+import { AsdfSystemsProvider } from "./asdfSystems";
 
 let client: LanguageClient | undefined;
 
@@ -15,20 +16,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   await client.start();
 
   const structure = new LispStructureProvider();
+  const asdf = new AsdfSystemsProvider(client);
   context.subscriptions.push(
     vscode.window.registerTreeDataProvider("sexprScope.structure", structure),
+    vscode.window.registerTreeDataProvider("sexprScope.asdfSystems", asdf),
     vscode.window.onDidChangeActiveTextEditor(() => structure.refresh()),
-    vscode.workspace.onDidSaveTextDocument(() => structure.refresh()),
+    vscode.workspace.onDidSaveTextDocument((doc) => {
+      structure.refresh();
+      // ASDF project data depends on `.asd` and mapped source files.
+      if (/\.(asd|lisp|cl|lsp)$/i.test(doc.fileName)) asdf.refresh();
+    }),
     vscode.commands.registerCommand("sexprScope.refreshStructure", () =>
       structure.refresh(),
+    ),
+    vscode.commands.registerCommand("sexprScope.refreshAsdfSystems", () =>
+      asdf.refresh(),
     ),
     vscode.commands.registerCommand("sexprScope.restartServer", async () => {
       await client?.restart();
       structure.refresh();
+      asdf.refresh();
     }),
   );
 
   structure.refresh();
+  asdf.refresh();
 }
 
 export async function deactivate(): Promise<void> {

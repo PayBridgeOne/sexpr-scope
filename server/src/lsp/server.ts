@@ -1,7 +1,11 @@
 import {
   Connection,
+  CodeAction,
+  CodeActionKind,
+  CodeActionParams,
   CompletionItem,
   CompletionParams,
+  Diagnostic,
   DidChangeConfigurationNotification,
   DidChangeWatchedFilesParams,
   DocumentSymbol,
@@ -46,6 +50,12 @@ import {
   toLspSymbolKind,
   toSignatureHelp,
 } from "./conversions";
+import { AsdfProject, AsdfProjectDto } from "../asdf/project";
+import { computeAsdfCodeActions } from "../asdf/code-actions";
+import { AsdfDiagnostic } from "../asdf/model";
+
+/** Custom (non-standard-LSP) request exposing the static ASDF project model. */
+export const ASDF_SYSTEMS_REQUEST = "sexprScope/asdfSystems";
 
 /** Handle returned by {@link createServer}, exposing the init readiness barrier. */
 export interface ServerHandle {
@@ -82,14 +92,57 @@ export function createServer(connection: Connection): ServerHandle {
   // initial scan settles so cross-file package information is available; after
   // that, any buffer edit may change diagnostics in *other* open files (e.g. a
   // changed `defpackage` export), so every open buffer is refreshed together.
+  //
+  // ASDF project diagnostics (cycles, missing components/sources) are computed
+  // separately from the per-file M2 diagnostics and cached per `.asd` URI, then
+  // merged into the published set so they surface in the Problems view and clear
+  // once the underlying `.asd` is fixed.
   let initialized = false;
+  const asdfDiagnostics = new Map<string, Diagnostic[]>();
+
+  const asdfToLsp = (d: AsdfDiagnostic): Diagnostic =>
+    toLspDiagnostic({
+      range: d.range,
+      message: d.message,
+      severity: d.severity,
+      code: d.code,
+      source: d.source,
+    });
+
   const publishDiagnosticsFor = (uri: string): void => {
-    const diagnostics = index.diagnostics(uri).map(toLspDiagnostic);
-    connection.sendDiagnostics({ uri, diagnostics });
+    const base = index.hasDocument(uri)
+      ? index.diagnostics(uri).map(toLspDiagnostic)
+      : [];
+    const asdf = asdfDiagnostics.get(uri) ?? [];
+    connection.sendDiagnostics({ uri, diagnostics: [...base, ...asdf] });
   };
+
+  // Recomputes the ASDF diagnostic cache and returns the set of URIs whose ASDF
+  // diagnostics may have changed (previous ∪ current), so cleared ones are
+  // republished to empty.
+  const recomputeAsdfDiagnostics = (): Set<string> => {
+    const affected = new Set<string>(asdfDiagnostics.keys());
+    asdfDiagnostics.clear();
+    if (initialized) {
+      const byUri = new AsdfProject(index).diagnosticsByUri();
+      for (const [uri, diags] of byUri) {
+        if (diags.length > 0) asdfDiagnostics.set(uri, diags.map(asdfToLsp));
+      }
+    }
+    for (const uri of asdfDiagnostics.keys()) affected.add(uri);
+    return affected;
+  };
+
   const publishAllOpen = (): void => {
     if (!initialized) return;
-    for (const uri of openDocuments) publishDiagnosticsFor(uri);
+    const affected = recomputeAsdfDiagnostics();
+    for (const uri of openDocuments) {
+      publishDiagnosticsFor(uri);
+      affected.delete(uri);
+    }
+    // `.asd` files are project-level; publish their diagnostics even when the
+    // file is not open in an editor so cycles/missing sources remain visible.
+    for (const uri of affected) publishDiagnosticsFor(uri);
   };
 
   const reindexOpen = (doc: TextDocument) => {
@@ -152,6 +205,7 @@ export function createServer(connection: Connection): ServerHandle {
           },
           full: true,
         },
+        codeActionProvider: true,
       },
       serverInfo: { name: "sexpr-scope-server", version: "0.1.0" },
     };
@@ -163,21 +217,31 @@ export function createServer(connection: Connection): ServerHandle {
       .catch(() => undefined);
   });
 
-  connection.onDidChangeWatchedFiles((params: DidChangeWatchedFilesParams) => {
-    for (const change of params.changes) {
-      const uri = change.uri;
-      // Open buffers are authoritative; ignore disk events for them.
-      if (openDocuments.has(uri)) continue;
-      if (!isSourceUri(uri)) continue;
-      if (change.type === FileChangeType.Deleted) {
-        index.removeDocument(uri);
-      } else {
-        void reindexFromDisk(uri);
+  connection.onDidChangeWatchedFiles(
+    async (params: DidChangeWatchedFilesParams): Promise<void> => {
+      // Deletions are synchronous (just drop the document), but reindexing a
+      // created/modified closed file reads from disk asynchronously. Apply all
+      // watcher changes first and AWAIT every reindex, then refresh diagnostics
+      // for open buffers — otherwise diagnostics would be recomputed against a
+      // half-updated index (the M2 watched-file race).
+      const reindexes: Promise<void>[] = [];
+      for (const change of params.changes) {
+        const uri = change.uri;
+        // Open buffers are authoritative; ignore disk events for them.
+        if (openDocuments.has(uri)) continue;
+        if (!isSourceUri(uri)) continue;
+        if (change.type === FileChangeType.Deleted) {
+          index.removeDocument(uri);
+        } else {
+          reindexes.push(reindexFromDisk(uri));
+        }
       }
-    }
-    // A disk-side package change can affect diagnostics in open buffers.
-    publishAllOpen();
-  });
+      await Promise.all(reindexes);
+      // A disk-side package change can affect diagnostics in open buffers; now
+      // that every reindex has settled, the refresh sees the up-to-date index.
+      publishAllOpen();
+    },
+  );
 
   connection.onDocumentSymbol(async (params): Promise<DocumentSymbol[]> => {
     await ready;
@@ -306,6 +370,65 @@ export function createServer(connection: Connection): ServerHandle {
       const uri = params.textDocument.uri;
       if (!index.hasDocument(uri)) return { data: [] };
       return { data: encodeSemanticTokens(index.semanticTokens(uri)) };
+    },
+  );
+
+  // Custom request: the static ASDF project model. This is intentionally not a
+  // standard LSP method — ASDF systems/components/dependencies have no LSP
+  // equivalent. The response is a client-safe DTO (plain data, LSP-style
+  // ranges); no parser AST or mutable server state is exposed.
+  connection.onRequest(
+    ASDF_SYSTEMS_REQUEST,
+    async (): Promise<AsdfProjectDto> => {
+      await ready;
+      return new AsdfProject(index).toDto();
+    },
+  );
+
+  connection.onCodeAction(
+    async (params: CodeActionParams): Promise<CodeAction[]> => {
+      await ready;
+      const uri = params.textDocument.uri;
+      if (!uri.toLowerCase().endsWith(".asd")) return [];
+      const doc = index.getDocument(uri);
+      if (!doc) return [];
+      const startOffset = offsetOf(
+        doc.text,
+        params.range.start.line,
+        params.range.start.character,
+      );
+      const endOffset = offsetOf(
+        doc.text,
+        params.range.end.line,
+        params.range.end.character,
+      );
+      const selection = {
+        start: {
+          offset: startOffset,
+          line: params.range.start.line,
+          character: params.range.start.character,
+        },
+        end: {
+          offset: endOffset,
+          line: params.range.end.line,
+          character: params.range.end.character,
+        },
+      };
+      const analysis = new AsdfProject(index).analyze();
+      return computeAsdfCodeActions(analysis, uri, selection).map((action) => ({
+        title: action.title,
+        kind: CodeActionKind.QuickFix,
+        edit: {
+          changes: {
+            [uri]: [
+              {
+                range: toLspRange(action.edit.range),
+                newText: action.edit.newText,
+              },
+            ],
+          },
+        },
+      }));
     },
   );
 

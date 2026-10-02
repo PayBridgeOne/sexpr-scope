@@ -12,7 +12,8 @@
     "Programming Languages"
   ],
   "activationEvents": [
-    "onLanguage:commonlisp"
+    "onLanguage:commonlisp",
+    "onView:sexprScope.asdfSystems"
   ],
   "main": "./out/src/extension.js",
   "contributes": {
@@ -39,6 +40,11 @@
           "id": "sexprScope.structure",
           "name": "Lisp Structure",
           "when": "resourceLangId == commonlisp"
+        },
+        {
+          "id": "sexprScope.asdfSystems",
+          "name": "ASDF Systems",
+          "when": "workspaceFolderCount != 0"
         }
       ]
     },
@@ -51,6 +57,11 @@
         "command": "sexprScope.refreshStructure",
         "title": "SexprScope: Refresh Lisp Structure",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "sexprScope.refreshAsdfSystems",
+        "title": "SexprScope: Refresh ASDF Systems",
+        "icon": "$(refresh)"
       }
     ],
     "menus": {
@@ -58,6 +69,11 @@
         {
           "command": "sexprScope.refreshStructure",
           "when": "view == sexprScope.structure",
+          "group": "navigation"
+        },
+        {
+          "command": "sexprScope.refreshAsdfSystems",
+          "when": "view == sexprScope.asdfSystems",
           "group": "navigation"
         }
       ]
@@ -82,6 +98,7 @@
   "scripts": {
     "build": "tsc -p ./tsconfig.json",
     "watch": "tsc -w -p ./tsconfig.json",
+    "test": "tsc -p ./tsconfig.json && node --test out/test/*.test.js",
     "vscode:prepublish": "npm run build"
   },
   "dependencies": {
