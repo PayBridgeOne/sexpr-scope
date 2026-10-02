@@ -16,10 +16,10 @@ import {
 } from "vscode-languageserver";
 import { TextDocument } from "vscode-languageserver-textdocument";
 import { URI } from "vscode-languageserver";
-import { WorkspaceIndex } from "../indexer/workspace-index";
-import { atomAtOffset, referenceNamespaceAt } from "../parser/reader";
-import type { Document } from "../parser/reader";
-import { Namespace, parseQualifiedName } from "../model/symbol";
+import { WorkspaceIndex, ReferenceNamespace } from "../indexer/workspace-index";
+import { atomAtOffset } from "../parser/reader";
+import { DEFAULT_PACKAGE, Namespace, QualifiedName } from "../model/symbol";
+import { Reference, ReferenceContext, referenceAt } from "../model/reference";
 import {
   isSourceUri,
   reindexUriFromDisk,
@@ -33,23 +33,44 @@ import {
   toLspSymbolKind,
 } from "./conversions";
 
+/** Handle returned by {@link createServer}, exposing the init readiness barrier. */
+export interface ServerHandle {
+  /**
+   * Resolves once the initial workspace scan has completed (or failed safely).
+   * Semantic requests await this so navigation is never served against a
+   * half-built index.
+   */
+  readonly whenReady: Promise<void>;
+}
+
 /**
  * Wires the static language intelligence to an LSP connection.
  *
  * Only static, non-evaluating features are served here. Anything requiring a
  * live image belongs to the separate runtime protocol (see protocol/).
  */
-export function createServer(connection: Connection): void {
+export function createServer(connection: Connection): ServerHandle {
   const index = new WorkspaceIndex();
   const documents = new TextDocuments(TextDocument);
   // URIs whose content is currently owned by an open editor buffer. On-disk
   // changes to these files are ignored; the buffer is the source of truth.
   const openDocuments = new Set<string>();
 
+  // Readiness barrier: the initial workspace scan runs during initialization,
+  // but init itself does not block. Semantic requests await `ready`, so by the
+  // time any navigation is served the initial static index is complete.
+  let markReady!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    markReady = resolve;
+  });
+
   const reindexOpen = (doc: TextDocument) => {
     openDocuments.add(doc.uri);
     index.setDocument(doc.uri, doc.getText());
   };
+
+  const reindexFromDisk = (uri: string): Promise<void> =>
+    reindexUriFromDisk(uri, index);
 
   documents.onDidOpen((e) => reindexOpen(e.document));
   documents.onDidChangeContent((e) => reindexOpen(e.document));
@@ -60,11 +81,13 @@ export function createServer(connection: Connection): void {
     void reindexFromDisk(e.document.uri);
   });
 
-  const reindexFromDisk = (uri: string): Promise<void> =>
-    reindexUriFromDisk(uri, index);
-
   connection.onInitialize((params: InitializeParams): InitializeResult => {
-    void scanWorkspace(index, params, openDocuments).catch(() => undefined);
+    // Kick off the initial scan without blocking initialization, but signal
+    // readiness only once it settles. Unreadable files are skipped inside the
+    // scan, so this always completes rather than blocking forever.
+    scanWorkspace(index, params, openDocuments)
+      .catch(() => undefined)
+      .finally(() => markReady());
     return {
       capabilities: {
         textDocumentSync: TextDocumentSyncKind.Incremental,
@@ -97,7 +120,8 @@ export function createServer(connection: Connection): void {
     }
   });
 
-  connection.onDocumentSymbol((params): DocumentSymbol[] => {
+  connection.onDocumentSymbol(async (params): Promise<DocumentSymbol[]> => {
+    await ready;
     const uri = params.textDocument.uri;
     const symbols = index.symbolsInDocument(uri);
     return symbols.map((sym) => ({
@@ -109,58 +133,91 @@ export function createServer(connection: Connection): void {
     }));
   });
 
-  connection.onWorkspaceSymbol((params): (SymbolInformation | WorkspaceSymbol)[] => {
-    return index.searchSymbols(params.query).map((sym) => ({
-      name: `${sym.package}:${sym.name}`,
-      kind: toLspSymbolKind(sym.kind),
-      location: { uri: sym.uri, range: toLspRange(sym.selectionRange) },
-    }));
-  });
+  connection.onWorkspaceSymbol(
+    async (params): Promise<(SymbolInformation | WorkspaceSymbol)[]> => {
+      await ready;
+      return index.searchSymbols(params.query).map((sym) => ({
+        name: `${sym.package}:${sym.name}`,
+        kind: toLspSymbolKind(sym.kind),
+        location: { uri: sym.uri, range: toLspRange(sym.selectionRange) },
+      }));
+    },
+  );
 
-  connection.onDefinition((params): Location[] => {
+  connection.onDefinition(async (params): Promise<Location[]> => {
+    await ready;
     const uri = params.textDocument.uri;
     const doc = index.getDocument(uri);
     if (!doc) return [];
     const offset = offsetOf(doc.text, params.position.line, params.position.character);
-    const atom = atomAtOffset(doc, offset);
-    if (!atom) return [];
-    const ref = parseQualifiedName(atom.text);
+    const reference = referenceAt(doc, offset);
+    if (!reference) return [];
+    const namespace = namespaceForContext(reference.context);
+    // A quoted/literal data symbol is not a binding reference: return nothing
+    // rather than guess a function or value definition.
+    if (namespace === undefined) return [];
     const currentPackage = index.packageAt(uri, offset);
-    const namespace = namespaceAt(doc, offset);
-    const defs = index.resolveReference(ref, currentPackage, { namespace });
+    const defs = index.resolveReference(toQualifiedName(reference), currentPackage, {
+      namespace,
+    });
     return defs.map((sym) => ({
       uri: sym.uri,
       range: toLspRange(sym.selectionRange),
     }));
   });
 
-  connection.onHover((params): Hover | null => {
+  connection.onHover(async (params): Promise<Hover | null> => {
+    await ready;
     const uri = params.textDocument.uri;
     const doc = index.getDocument(uri);
     if (!doc) return null;
     const offset = offsetOf(doc.text, params.position.line, params.position.character);
-    const atom = atomAtOffset(doc, offset);
-    if (!atom) return null;
-    const ref = parseQualifiedName(atom.text);
+    const reference = referenceAt(doc, offset);
+    if (!reference) return null;
+    const namespace = namespaceForContext(reference.context);
+    if (namespace === undefined) return null;
     const currentPackage = index.packageAt(uri, offset);
-    const namespace = namespaceAt(doc, offset);
-    const defs = index.resolveReference(ref, currentPackage, { namespace });
+    const defs = index.resolveReference(toQualifiedName(reference), currentPackage, {
+      namespace,
+    });
     if (defs.length === 0) return null;
+    const atom = atomAtOffset(doc, offset);
     return {
       contents: { kind: "markdown", value: hoverMarkdown(defs[0]) },
-      range: toLspRange(atom.range),
+      range: atom ? toLspRange(atom.range) : undefined,
     };
   });
 
   documents.listen(connection);
   connection.listen();
+
+  return { whenReady: ready };
 }
 
-/** Maps the reader's syntactic namespace hint onto the resolver's type. */
-function namespaceAt(doc: Document, offset: number): Namespace | "any" {
-  return referenceNamespaceAt(doc, offset) === "function"
-    ? Namespace.Function
-    : "any";
+/** Projects a classified reference onto the resolver's `QualifiedName` shape. */
+function toQualifiedName(reference: Reference): QualifiedName {
+  return {
+    name: reference.name,
+    packagePrefix: reference.packagePrefix,
+    qualification: reference.qualification,
+  };
+}
+
+/**
+ * Maps a Lisp-2 reference context onto the namespace the resolver should search.
+ * Returns `undefined` for data positions, which must not resolve at all.
+ */
+function namespaceForContext(
+  context: ReferenceContext,
+): ReferenceNamespace | undefined {
+  switch (context) {
+    case ReferenceContext.Function:
+      return Namespace.Function;
+    case ReferenceContext.Value:
+      return Namespace.Value;
+    case ReferenceContext.Data:
+      return undefined;
+  }
 }
 
 /**

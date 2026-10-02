@@ -6,7 +6,6 @@ import {
   NodeKind,
   isList,
   atomAtOffset,
-  referenceNamespaceAt,
 } from "../src/parser/reader";
 
 test("tokenizer treats #. read-eval as an inert prefix, never evaluating", () => {
@@ -117,28 +116,4 @@ test("atomAtOffset does not surface atoms inside a #; discard", () => {
   const doc = parseDocument("file:///a.lisp", text);
   const atom = atomAtOffset(doc, text.indexOf("b"));
   assert.equal(atom, undefined);
-});
-
-test("referenceNamespaceAt marks a list head as the function namespace", () => {
-  const text = "(process tx)";
-  const doc = parseDocument("file:///a.lisp", text);
-  assert.equal(referenceNamespaceAt(doc, text.indexOf("process") + 1), "function");
-});
-
-test("referenceNamespaceAt treats an argument position as any", () => {
-  const text = "(frob process)";
-  const doc = parseDocument("file:///a.lisp", text);
-  assert.equal(referenceNamespaceAt(doc, text.indexOf("process") + 1), "any");
-});
-
-test("referenceNamespaceAt treats #'name as the function namespace", () => {
-  const text = "(mapcar #'process items)";
-  const doc = parseDocument("file:///a.lisp", text);
-  assert.equal(referenceNamespaceAt(doc, text.indexOf("process") + 1), "function");
-});
-
-test("referenceNamespaceAt treats a quoted list head as any, not a call", () => {
-  const text = "'(process tx)";
-  const doc = parseDocument("file:///a.lisp", text);
-  assert.equal(referenceNamespaceAt(doc, text.indexOf("process") + 1), "any");
 });

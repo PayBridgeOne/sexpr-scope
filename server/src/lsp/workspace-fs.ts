@@ -1,5 +1,6 @@
 import { promises as fs } from "fs";
 import * as path from "path";
+import { fileURLToPath, pathToFileURL } from "url";
 import { WorkspaceIndex } from "../indexer/workspace-index";
 
 /** File extensions SexprScope reads statically (never evaluates). */
@@ -23,26 +24,32 @@ export function isSourceUri(uri: string): boolean {
   return fsPath ? isSourcePath(fsPath) : false;
 }
 
-/** Decodes a `file:` URI into a local filesystem path, or undefined. */
+/**
+ * Decodes a `file:` URI into a local filesystem path, or undefined.
+ *
+ * Delegates to Node's `fileURLToPath`, which correctly handles percent-encoding
+ * (spaces, Unicode), Windows drive letters (`file:///C:/…`) and UNC authorities
+ * (`file://host/share`). Only `file:` URIs are accepted.
+ */
 export function uriToFsPath(uri: string): string | undefined {
   try {
     const u = new URL(uri);
     if (u.protocol !== "file:") return undefined;
-    return decodeURIComponent(u.pathname);
+    return fileURLToPath(u);
   } catch {
     return undefined;
   }
 }
 
-/** Encodes a local filesystem path as a `file:` URI. */
+/**
+ * Encodes a local filesystem path as a `file:` URI.
+ *
+ * Delegates to Node's `pathToFileURL`, which performs the correct per-segment
+ * percent-encoding and platform-specific handling (drive letters, UNC paths,
+ * separators) that a hand-rolled encoder tends to get wrong.
+ */
 export function fsPathToUri(fsPath: string): string {
-  const resolved = path.resolve(fsPath);
-  const encoded = resolved
-    .split(path.sep)
-    .map((segment) => encodeURIComponent(segment))
-    .join("/");
-  const leading = encoded.startsWith("/") ? "" : "/";
-  return `file://${leading}${encoded}`;
+  return pathToFileURL(path.resolve(fsPath)).href;
 }
 
 /**

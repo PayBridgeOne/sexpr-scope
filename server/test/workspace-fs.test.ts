@@ -42,6 +42,43 @@ test("uriToFsPath / fsPathToUri round-trip a path with spaces", () => {
   assert.equal(uriToFsPath(uri), path.resolve(p));
 });
 
+test("fsPathToUri percent-encodes spaces and Unicode", () => {
+  const uri = fsPathToUri("/tmp/a dir/café.lisp");
+  // A space must be encoded, never left literal, and the URI must be a file URI.
+  assert.ok(uri.startsWith("file:///"));
+  assert.ok(!uri.includes(" "), uri);
+  assert.ok(uri.includes("%20"), uri);
+});
+
+test("uriToFsPath / fsPathToUri round-trip a Unicode path", () => {
+  const p = path.join(os.tmpdir(), "проект", "café.lisp");
+  const uri = fsPathToUri(p);
+  assert.equal(uriToFsPath(uri), path.resolve(p));
+});
+
+test("uriToFsPath / fsPathToUri round-trip a path with special URI characters", () => {
+  const p = path.join(os.tmpdir(), "a#b", "c%d e.lisp");
+  const uri = fsPathToUri(p);
+  assert.equal(uriToFsPath(uri), path.resolve(p));
+});
+
+test("uriToFsPath decodes a percent-encoded file URI", () => {
+  assert.equal(uriToFsPath("file:///tmp/a%20b/c.lisp"), "/tmp/a b/c.lisp");
+});
+
+test("uriToFsPath rejects non-file and malformed URIs", () => {
+  assert.equal(uriToFsPath("http://example.com/a.lisp"), undefined);
+  assert.equal(uriToFsPath("not a uri"), undefined);
+  assert.equal(uriToFsPath("untitled:Untitled-1"), undefined);
+});
+
+test("fsPathToUri parses a Windows drive-letter URI back to a path", () => {
+  // Node's URL handling keeps drive-letter file URIs well-formed on every
+  // platform; the decoded form always carries the colon after the drive.
+  const fsPath = uriToFsPath("file:///C:/work/app.lisp");
+  assert.ok(fsPath && fsPath.includes("C:"), String(fsPath));
+});
+
 test("isSourceUri honors the decoded extension", () => {
   assert.equal(isSourceUri(fsPathToUri("/x/y.lisp")), true);
   assert.equal(isSourceUri(fsPathToUri("/x/y.txt")), false);

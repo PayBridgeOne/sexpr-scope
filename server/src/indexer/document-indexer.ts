@@ -10,6 +10,7 @@ import {
 import { Range } from "../parser/position";
 import {
   BindingScope,
+  DEFAULT_PACKAGE,
   PackageDefinition,
   SymbolDefinition,
   SymbolKind,
@@ -18,8 +19,6 @@ import {
   namespaceOfKind,
   parseQualifiedName,
 } from "../model/symbol";
-
-const DEFAULT_PACKAGE = "COMMON-LISP-USER";
 
 /** Operator name (upper-cased) → kind of symbol it defines. */
 const DEFINERS: ReadonlyMap<string, SymbolKind> = new Map([
@@ -199,14 +198,18 @@ export function indexDocument(doc: Document): DocumentIndex {
   for (const root of doc.roots) {
     // A `#+`/`#-` reader conditional guards its datum; index the guarded form
     // but mark anything it defines as conditional (uncertain under static
-    // analysis). The feature expression itself is never interpreted.
+    // analysis). The feature expression itself is never interpreted — only its
+    // raw text is preserved for future runtime reconciliation.
     if (root.kind === NodeKind.ReaderConditional) {
       if (root.child) {
-        indexForm(doc, root.child, state, true, symbols, packages, packageSegments);
+        const feature = root.feature
+          ? `${root.polarity}${rawText(doc, root.feature.range)}`
+          : undefined;
+        indexForm(doc, root.child, state, true, feature, symbols, packages, packageSegments);
       }
       continue;
     }
-    indexForm(doc, root, state, false, symbols, packages, packageSegments);
+    indexForm(doc, root, state, false, undefined, symbols, packages, packageSegments);
   }
 
   return { uri: doc.uri, symbols, packages, packageSegments };
@@ -218,6 +221,7 @@ function indexForm(
   node: SyntaxNode,
   state: { currentPackage: string },
   conditional: boolean,
+  featureExpression: string | undefined,
   symbols: SymbolDefinition[],
   packages: PackageDefinition[],
   packageSegments: PackageSegment[],
@@ -253,6 +257,7 @@ function indexForm(
         selectionRange: pkg.selectionRange,
         documentation: pkg.documentation,
         conditional: conditional || undefined,
+        featureExpression,
         origin: SymbolOrigin.Static,
       });
     }
@@ -296,6 +301,7 @@ function indexForm(
     documentation,
     lambdaList,
     conditional: conditional || undefined,
+    featureExpression,
     methodImplementation: kind === SymbolKind.Method ? true : undefined,
     origin: SymbolOrigin.Static,
   });

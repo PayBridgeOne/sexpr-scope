@@ -175,3 +175,116 @@ test("a conditional in-package does not rebind the current package", () => {
   const sym = idx.allSymbols().find((s) => s.name === "CHARGE");
   assert.equal(sym?.package, "PAYMENT");
 });
+
+test("CL resolves to COMMON-LISP without any defpackage", () => {
+  const idx = new WorkspaceIndex();
+  idx.setDocument("file:///a.lisp", "(defun noop () nil)");
+  assert.equal(idx.resolvePackageName("CL"), "COMMON-LISP");
+  assert.equal(idx.resolvePackageName("COMMON-LISP"), "COMMON-LISP");
+});
+
+test("CL-USER resolves to COMMON-LISP-USER without any defpackage", () => {
+  const idx = new WorkspaceIndex();
+  idx.setDocument("file:///a.lisp", "(defun noop () nil)");
+  assert.equal(idx.resolvePackageName("CL-USER"), "COMMON-LISP-USER");
+  assert.equal(idx.resolvePackageName("COMMON-LISP-USER"), "COMMON-LISP-USER");
+});
+
+test("definitions before and after (in-package :cl-user) share COMMON-LISP-USER", () => {
+  const idx = new WorkspaceIndex();
+  idx.setDocument(
+    "file:///a.lisp",
+    `(defun first-definition () 1)
+(in-package :cl-user)
+(defun second-definition () 2)`,
+  );
+  const first = idx.allSymbols().find((s) => s.name === "FIRST-DEFINITION");
+  const second = idx.allSymbols().find((s) => s.name === "SECOND-DEFINITION");
+  assert.equal(first?.package, "COMMON-LISP-USER");
+  assert.equal(second?.package, "COMMON-LISP-USER");
+  // Both are reachable from the canonical package and from its nickname.
+  assert.equal(
+    idx.resolveReference(parseQualifiedName("second-definition"), "COMMON-LISP-USER", {
+      namespace: Namespace.Function,
+    }).length,
+    1,
+  );
+  assert.equal(
+    idx.resolveReference(parseQualifiedName("first-definition"), "CL-USER", {
+      namespace: Namespace.Function,
+    }).length,
+    1,
+  );
+});
+
+test("external vs internal qualification is enforced", () => {
+  const idx = new WorkspaceIndex();
+  idx.setDocument(
+    "file:///payment.lisp",
+    `(defpackage :payment
+  (:use :cl)
+  (:export :public))
+(in-package :payment)
+(defun public () 1)
+(defun private () 2)`,
+  );
+  // payment:public — single colon, exported symbol → resolves.
+  assert.equal(
+    idx.resolveReference(parseQualifiedName("payment:public"), "CL-USER").length,
+    1,
+  );
+  // payment:private — single colon, internal symbol → no result.
+  assert.equal(
+    idx.resolveReference(parseQualifiedName("payment:private"), "CL-USER").length,
+    0,
+  );
+  // payment::public — double colon, external symbol → resolves.
+  assert.equal(
+    idx.resolveReference(parseQualifiedName("payment::public"), "CL-USER").length,
+    1,
+  );
+  // payment::private — double colon, internal symbol → resolves.
+  assert.equal(
+    idx.resolveReference(parseQualifiedName("payment::private"), "CL-USER").length,
+    1,
+  );
+});
+
+test("an uninterned #:foo never resolves to a global definition", () => {
+  const idx = new WorkspaceIndex();
+  idx.setDocument("file:///a.lisp", "(in-package :cl-user)\n(defun foo () 1)");
+  // The same print name resolves when interned in the current package.
+  assert.equal(
+    idx.resolveReference(parseQualifiedName("foo"), "CL-USER", {
+      namespace: Namespace.Function,
+    }).length,
+    1,
+  );
+  // But the uninterned symbol has no global identity and must not resolve.
+  assert.equal(
+    idx.resolveReference(parseQualifiedName("#:foo"), "CL-USER", {
+      namespace: Namespace.Function,
+    }).length,
+    0,
+  );
+});
+
+test("function and value references pick distinct same-named definitions", () => {
+  const idx = new WorkspaceIndex();
+  idx.setDocument(
+    "file:///a.lisp",
+    `(in-package :cl-user)
+(defvar thing 1)
+(defun thing () 2)`,
+  );
+  const value = idx.resolveReference(parseQualifiedName("thing"), "CL-USER", {
+    namespace: Namespace.Value,
+  });
+  assert.equal(value.length, 1);
+  assert.equal(value[0].kind, SymbolKind.Variable);
+  const fn = idx.resolveReference(parseQualifiedName("thing"), "CL-USER", {
+    namespace: Namespace.Function,
+  });
+  assert.equal(fn.length, 1);
+  assert.equal(fn[0].kind, SymbolKind.Function);
+});
