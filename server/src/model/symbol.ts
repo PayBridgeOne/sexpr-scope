@@ -126,12 +126,29 @@ export interface SymbolDefinition {
   readonly origin: SymbolOrigin;
 }
 
+/**
+ * A symbol brought into a package from another package, via `:import-from` or
+ * `:shadowing-import-from`. `from` is the source package designator exactly as
+ * written (it is canonicalized through the package alias table at resolution
+ * time); `name` is the imported symbol's print name.
+ */
+export interface PackageImport {
+  readonly from: string;
+  readonly name: string;
+}
+
 /** A parsed package model derived from a `defpackage` form. */
 export interface PackageDefinition {
   readonly name: string;
   readonly nicknames: string[];
   readonly uses: string[];
   readonly exports: string[];
+  /** Symbols imported from other packages via `:import-from`. */
+  readonly imports: PackageImport[];
+  /** Print names shadowed locally via `:shadow` (fresh symbols in this package). */
+  readonly shadows: string[];
+  /** Symbols imported *and* shadowed via `:shadowing-import-from`. */
+  readonly shadowingImports: PackageImport[];
   readonly uri: string;
   readonly range: Range;
   readonly selectionRange: Range;

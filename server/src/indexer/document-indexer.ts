@@ -151,6 +151,9 @@ function parseDefpackage(doc: Document, form: ListNode): PackageDefinition | und
   const nicknames: string[] = [];
   const uses: string[] = [];
   const exports: string[] = [];
+  const imports: { from: string; name: string }[] = [];
+  const shadows: string[] = [];
+  const shadowingImports: { from: string; name: string }[] = [];
 
   for (let i = 2; i < form.children.length; i++) {
     const opt = stripPrefixes(form.children[i]);
@@ -169,6 +172,25 @@ function parseDefpackage(doc: Document, form: ListNode): PackageDefinition | und
       case "EXPORT":
         exports.push(...values);
         break;
+      case "SHADOW":
+        shadows.push(...values);
+        break;
+      case "IMPORT-FROM":
+        // (:import-from <package> <symbol>...). The first designator names the
+        // source package; the remainder are the imported symbols.
+        if (values.length >= 2) {
+          const from = values[0];
+          for (const name of values.slice(1)) imports.push({ from, name });
+        }
+        break;
+      case "SHADOWING-IMPORT-FROM":
+        if (values.length >= 2) {
+          const from = values[0];
+          for (const name of values.slice(1)) {
+            shadowingImports.push({ from, name });
+          }
+        }
+        break;
       default:
         break;
     }
@@ -179,6 +201,9 @@ function parseDefpackage(doc: Document, form: ListNode): PackageDefinition | und
     nicknames,
     uses,
     exports,
+    imports,
+    shadows,
+    shadowingImports,
     uri: doc.uri,
     range: form.range,
     selectionRange: nameNode.range,

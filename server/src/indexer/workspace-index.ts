@@ -26,6 +26,7 @@ import {
 } from "../model/resolution";
 import { analyzeScopes } from "../analyzer/scope-analyzer";
 import { DocumentIndex, indexDocument, packageAtOffset } from "./document-indexer";
+import { PackageResolver, PackageSymbolAccess } from "./package-resolver";
 
 interface Entry {
   readonly doc: Document;
@@ -65,6 +66,13 @@ export class WorkspaceIndex {
   private packagesByName = new Map<string, PackageDefinition>();
   /** nickname / name (upper-cased) → canonical package name. */
   private packageAliases = new Map<string, string>();
+  /** Package accessibility model (use/import/shadow/inheritance), rebuilt lazily. */
+  private packageResolver = new PackageResolver(
+    new Map(),
+    new Map(),
+    new Map(),
+    new Map(),
+  );
   private dirty = true;
 
   setDocument(uri: string, text: string): DocumentIndex {
@@ -134,6 +142,36 @@ export class WorkspaceIndex {
         }
       }
     }
+
+    // Build the accessibility model once the alias table is known. `definedNames`
+    // records the home package of every global definition; `exportedNames` is the
+    // union of each package's `:export` list and any definition flagged exported.
+    const definedNames = new Map<string, Set<string>>();
+    const exportedNames = new Map<string, Set<string>>();
+    const add = (map: Map<string, Set<string>>, pkg: string, name: string) => {
+      let set = map.get(pkg);
+      if (!set) map.set(pkg, (set = new Set()));
+      set.add(name);
+    };
+    for (const pkg of this.packagesByName.values()) {
+      for (const name of pkg.exports) add(exportedNames, pkg.name, name);
+    }
+    for (const { index } of this.entries.values()) {
+      for (const sym of index.symbols) {
+        if (sym.scope !== BindingScope.Global) continue;
+        const canonical = this.packageAliases.get(sym.package) ?? sym.package;
+        add(definedNames, canonical, sym.name);
+        const pkg = this.packagesByName.get(canonical);
+        const exported = pkg ? pkg.exports.includes(sym.name) : sym.exported;
+        if (exported) add(exportedNames, canonical, sym.name);
+      }
+    }
+    this.packageResolver = new PackageResolver(
+      this.packagesByName,
+      this.packageAliases,
+      definedNames,
+      exportedNames,
+    );
     this.dirty = false;
   }
 
@@ -221,19 +259,53 @@ export class WorkspaceIndex {
     if (ref.qualification === "uninterned" || ref.qualification === "keyword") {
       return [];
     }
-    const targetPackage = ref.packagePrefix
-      ? this.resolvePackageName(ref.packagePrefix)
-      : this.resolvePackageName(currentPackage);
     const wanted = options.namespace ?? "any";
 
+    // An explicitly-qualified `pkg:foo` / `pkg::foo` reference names a symbol in
+    // a specific package; external (single-colon) access requires it be exported.
+    if (ref.packagePrefix) {
+      const targetPackage = this.resolvePackageName(ref.packagePrefix);
+      return this.selectDefinitions(
+        ref.name,
+        targetPackage,
+        wanted,
+        ref.qualification === "external",
+      );
+    }
+
+    // An unqualified reference resolves through the package accessibility model
+    // (direct definition, import, shadow, or inheritance from `:use`d packages).
+    const access = this.packageResolver.classify(
+      this.resolvePackageName(currentPackage),
+      ref.name,
+    );
+    if (access.status === "ambiguous" || access.status === "none") return [];
+    return this.selectDefinitions(
+      ref.name,
+      access.homePackage,
+      wanted,
+      access.requireExported,
+    );
+  }
+
+  /**
+   * Selects the global definitions of `name` in canonical `pkg` matching the
+   * wanted namespace, applying the shared generic-over-method and
+   * unconditional-over-conditional preferences.
+   */
+  private selectDefinitions(
+    name: string,
+    pkg: string,
+    wanted: ReferenceNamespace,
+    requireExported: boolean,
+  ): SymbolDefinition[] {
     const inPackage = this.allSymbols().filter(
       (s) =>
         s.scope === BindingScope.Global &&
-        s.name === ref.name &&
-        s.package === targetPackage &&
+        s.name === name &&
+        s.package === pkg &&
         namespaceMatches(s.namespace, wanted) &&
-        // A single-colon `pkg:foo` reference must name an exported symbol.
-        (ref.qualification !== "external" || s.exported === true),
+        (!requireExported || s.exported === true),
     );
     if (inPackage.length === 0) return [];
 
@@ -247,6 +319,19 @@ export class WorkspaceIndex {
     if (generics.length > 0) return generics;
 
     return candidates;
+  }
+
+  /**
+   * Exposes the package accessibility model for an unqualified print name in a
+   * document position's current package. Completion, diagnostics and hover use
+   * this instead of re-deriving Common Lisp package rules.
+   */
+  packageAccess(currentPackage: string, name: string): PackageSymbolAccess {
+    this.ensureFresh();
+    return this.packageResolver.classify(
+      this.resolvePackageName(currentPackage),
+      name,
+    );
   }
 
   // ---------------------------------------------------------------------------
