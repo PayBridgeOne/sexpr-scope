@@ -8,9 +8,10 @@ editor-grade navigation and understanding on top. The long-term goal is a
 development experience closer to Rider/Visual Studio while keeping the
 interactive and structural strengths that make Lisp unique.
 
-> **Status:** Milestone 1 (foundation), hardened. A small but real vertical
-> slice of *static* navigation that works even when no Lisp image is running.
-> See [`docs/ROADMAP.md`](docs/ROADMAP.md) for what comes next.
+> **Status:** Milestone 2 (rich static intelligence), complete. Full static
+> navigation, completion, signature help and conservative diagnostics that work
+> even when no Lisp image is running. See [`docs/ROADMAP.md`](docs/ROADMAP.md)
+> for what comes next (M3 — an ASDF project model).
 
 ## What works today
 
@@ -47,8 +48,38 @@ interactive and structural strengths that make Lisp unique.
   unrelated package (no definition beats a wrong one).
 - **Generic functions vs methods** — a call resolves to the `defgeneric`;
   `defmethod`s are modeled as its implementations, not peer definitions.
-- **LSP features** — Document Symbols, Workspace Symbols, Go to Definition, and
-  Hover (kind, lambda list, docstring, export status).
+- **Lexical scope & Find References** — `let`/`let*`, `flet`/`labels`, `lambda`,
+  `multiple-value-bind`, `destructuring-bind` and lambda-list parameters are
+  modeled as real lexical bindings with correct, **ordered** visibility:
+  initializer and default forms see only the parameters bound before them
+  (required → `&optional` → supplied-p → `&rest` → `&key` → `&aux`), matching
+  ANSI lambda-list semantics. Find References groups uses by semantic identity
+  (a lexical binding stays within its own scope; a global symbol spans the
+  workspace), so two same-named `let` variables never conflate. `defgeneric`
+  contributes a signature but no fake lexical body bindings.
+- **Package-aware definition identity** — a bare definition name is interned
+  according to package rules, not blindly homed in the current package: a
+  `defun` of an imported, shadowing-imported or inherited name denotes that
+  symbol's original home, while `:shadow` creates a fresh local identity. Go to
+  Definition and Find References agree on that identity across packages.
+- **Static standard-library knowledge** — a catalog of standardized
+  `COMMON-LISP` symbols (functions, macros, special operators, types, constants
+  and special variables) lets ordinary code like `(mapcar #'f xs)`, `(when c …)`
+  or `(format t "~a" x)` be classified and completed without a running image.
+  No source locations are invented — Go to Definition never navigates to a fake
+  file — and nothing here evaluates Lisp.
+- **LSP features** — Document Symbols, Workspace Symbols, Go to Definition, Find
+  References, Hover (kind, lambda list, docstring, export status), Semantic
+  Tokens, **Completion** (Lisp-2- and package-aware, with replacement ranges
+  that preserve package qualifiers), **Signature Help** (from the callable's
+  lambda list, with source-structure-based active parameter) and **Diagnostics**
+  (conservative; see below).
+- **Conservative diagnostics** — only statically provable problems are reported:
+  an unknown explicit package, a `pkg:foo` reference to a symbol that exists in
+  `pkg` but is not exported, an ambiguously inherited symbol, and a clearly
+  invalid duplicate binding. An unknown function or variable is **never** flagged
+  — Common Lisp legitimately defines names at load time, via macros or at
+  runtime — so silence is always preferred over a false positive.
 - **Lisp Structure view** — a native VS Code tree grouping the active file's
   definitions by kind; click to jump to the source. Structural editing is
   intentionally not part of SexprScope. Structural views are read-only

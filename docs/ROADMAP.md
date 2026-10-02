@@ -54,35 +54,69 @@ A correctness pass hardening the static model before lexical scopes are added:
 - A clean, in-process LSP integration test covers init → indexing → open → Go to
   Definition into an unopened file → shutdown with no dangling handles.
 
-## Milestone 2 — Richer static intelligence
+## Milestone 2 — Richer static intelligence ✅
 
-### M2A — Lexical semantics + Find References
+All of M2 is implemented and surfaced through the LSP server; a dedicated
+**M2.1** integration/correctness pass wired the completion, signature-help and
+diagnostics engines through LSP, corrected ordered lambda-list scope and
+package-aware definition identity, and added static `COMMON-LISP` knowledge.
+
+### M2A — Lexical semantics + Find References ✅
 
 - Index lexical constructs: `let`, `let*`, `flet`, `labels`, `macrolet`,
   `symbol-macrolet`, `lambda`, `multiple-value-bind`, `destructuring-bind`.
+- Lambda-list parameters are bound with correct **ordered** visibility
+  (required → `&optional` → supplied-p → `&rest` → `&key` → `&aux`): an
+  initializer form sees only the parameters established before it, per ANSI
+  lambda-list semantics. `defgeneric` contributes signature metadata but no
+  lexical body bindings.
 - `textDocument/references` (Find References) over the resulting scopes.
 
-### M2B — Full package resolution
+### M2B — Full package resolution ✅
 
 - Resolve symbols through `:use`, `:import-from`, `:shadow`, and
   `:shadowing-import-from`, building on the M1.1.1 external/internal and builtin
   package foundations.
+- Definition identity is package-correct: a bare definition name denotes the
+  imported / shadowing-imported / inherited symbol it reads as, while `:shadow`
+  creates a fresh local identity. Go to Definition and Find References agree on
+  that identity across packages.
 
-### M2C — Semantic Tokens
+### M2C — Semantic Tokens ✅
 
 - `textDocument/semanticTokens` distinguishing special operators, macros,
   functions, generic functions, methods, classes, types, constants, special
   vs lexical variables, parameters, packages, keywords, slots, and undefined
   symbols.
+- Standardized `COMMON-LISP` symbols are classified from a static catalog
+  (`format`, `mapcar`, `when`, …) and tagged `defaultLibrary`.
 - Theme-aware decorations only; never hard-coded colors. Parentheses stay
   visible and editable.
 
-### M2D — Completion, Signature Help, Diagnostics
+### M2D — Completion, Signature Help, Diagnostics ✅
 
-- `textDocument/completion` and `textDocument/signatureHelp` from captured
-  lambda lists.
-- `textDocument/publishDiagnostics` for clearly static problems (e.g. duplicate
-  definitions, unbalanced forms).
+- `textDocument/completion`: Lisp-2- and package-aware candidates (lexical,
+  workspace-global and standard-library) with deterministic ranking and
+  replacement ranges that preserve `pkg:`/`pkg::` qualifiers.
+- `textDocument/signatureHelp` from captured lambda lists, with the active
+  parameter derived from source structure (nested argument forms do not throw
+  it off).
+- `textDocument/publishDiagnostics` for **statically provable** problems only
+  (unknown explicit package, non-exported external access, ambiguous inherited
+  symbol, clearly invalid duplicate binding); unknown functions/variables are
+  never flagged. Diagnostics refresh on buffer edits, initial indexing and
+  cross-file package changes, and are cleared when resolved or on close.
+
+### M2.1 — Static intelligence integration & correctness ✅
+
+- Completion, Signature Help and Diagnostics advertised and handled at the LSP
+  boundary (previously engine-only).
+- Ordered lambda-list scope and `defgeneric` scope corrected.
+- Package-aware definition identity corrected for imported / inherited /
+  shadowed / shadowing-imported symbols.
+- Static `COMMON-LISP` symbol catalog added (no invented source locations, no
+  evaluation) to improve completion and semantic classification.
+- Real LSP integration tests added for every advertised capability.
 
 ## Milestone 3 — ASDF project model
 

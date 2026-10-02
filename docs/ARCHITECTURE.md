@@ -4,7 +4,7 @@ SexprScope is an **IDE/tooling layer** for Common Lisp. It does not change the
 language: source files stay ordinary `.lisp` / `.cl` files, and the original
 source is always the authoritative representation.
 
-This document describes the architecture established by Milestone 1 and the
+This document describes the architecture established through Milestone 2 and the
 boundaries that let future milestones grow cleanly.
 
 ## Components
@@ -40,9 +40,10 @@ client, not an architectural dependency.
 SexprScope distinguishes a **static model** from a **live runtime model**:
 
 - The **static model** understands source code *without executing it*. It powers
-  document symbols, workspace symbols, Go-to-Definition and hover. It must keep
-  working even when no Lisp image is available — basic navigation never depends
-  on loading the project.
+  document symbols, workspace symbols, Go-to-Definition, Find References, hover,
+  semantic tokens, completion, signature help and conservative diagnostics. It
+  must keep working even when no Lisp image is available — static intelligence
+  never depends on loading the project.
 - The **live runtime model** (future) obtains information from a running SBCL
   image over the dedicated runtime protocol (`protocol/RUNTIME-PROTOCOL.md`).
 
@@ -137,8 +138,9 @@ Symbols are never treated as global strings. Every symbol carries its owning
 package, parsed from `defpackage` and tracked through `in-package`. The model
 understands `foo`, `package:foo`, `package::foo`, keyword `:foo`, and package
 nicknames, so two symbols with the same print name in different packages never
-collide (see `server/src/model/symbol.ts`). `defpackage` options understood in
-M1: `:use`, `:nicknames`, `:export`, `:documentation`.
+collide (see `server/src/model/symbol.ts`). `defpackage` options understood:
+`:use`, `:nicknames`, `:export`, `:documentation`, `:import-from`, `:shadow`
+and `:shadowing-import-from`.
 
 Package **identities are canonicalized**: a `defpackage` nickname is mapped back
 to its defining package name, so an `in-package` using a nickname (`:pay`) does
@@ -173,7 +175,7 @@ to a package definition.
 (set for `defmethod`), and `origin` (static vs runtime). Qualified references are
 parsed into a `qualification` of `none` / `keyword` / `internal` / `external` /
 `uninterned`, which drives package resolution. The indexer recognizes these
-definers in M1:
+definers:
 
 `defun`, `defmacro`, `define-compiler-macro`, `defgeneric`, `defmethod`,
 `defclass`, `defstruct`, `defvar`, `defparameter`, `defconstant`, `deftype`,
@@ -218,23 +220,106 @@ performed — that requires a running image.
 ### Global vs lexical bindings
 
 The symbol model distinguishes package-global definitions from lexical bindings
-(`scope`), so lexical constructs can be added later **without** inventing a fake
-package owner for a `let`/`flet`/`lambda` variable. M1 only indexes global
-definitions; the shape is in place for M2 lexical scope.
+(`scope`), so a `let`/`flet`/`lambda` variable is never given a fake package
+owner. M2 indexes lexical constructs — `let`, `let*`, `flet`, `labels`,
+`macrolet`, `symbol-macrolet`, `lambda`, `multiple-value-bind`,
+`destructuring-bind` and lambda-list parameters — as real bindings with their
+own scope ranges, which is what powers Find References.
+
+Lambda-list parameters are bound with **ordered** visibility rather than being
+treated as simultaneously bound. ANSI specifies that lambda-list initialization
+is sequential: required parameters are established first, then `&optional`
+(each supplied-p after its value), then `&rest`, then `&key` (and their
+supplied-p), then `&aux` (LET\*-like). Each `LambdaListVariable` therefore
+carries a `scopeStart` offset, and an initializer/default form only sees the
+parameters established before it. A new binding is *not* visible in its own
+initializer merely because it shares a print name with an outer binding — e.g.
+in `(lambda (&optional (x x)) x)` the init-form `x` refers to the outer `x`,
+while the body `x` refers to the parameter. `defgeneric` is **not** treated as
+a parameterized definer: it describes a generic function's congruence lambda
+list, not a lexical body, so it contributes signature metadata but creates no
+lexical bindings.
+
+### Package-aware definition identity
+
+A bare definition name is interned according to package accessibility, not
+blindly homed in the current package. Common Lisp reads a symbol *before*
+`defun`/`defvar` assign a binding, so if the source spelling already denotes an
+imported, shadowing-imported or inherited symbol, the definition belongs to that
+symbol's original home package. `WorkspaceIndex` resolves definition homes in a
+circularity-free first pass (package accessibility is decided before raw
+definitions are allowed to intern new local symbols): `:import-from` and
+`:shadowing-import-from` keep the exporting package's identity, an inherited
+symbol (via `:use`) stays homed in the used package, and `:shadow` creates a
+fresh local identity. Go-to-Definition and Find References consult the same
+`definitionHome` map, so they agree on identity across packages. Where static
+information is genuinely ambiguous the model declines to guess.
+
+### Static standard-library knowledge
+
+`server/src/model/standard-library.ts` is a catalog of standardized
+`COMMON-LISP` symbol names classified as function, macro, special operator,
+type/class/condition, constant or special variable. It is pure factual language
+metadata — **no** documentation bodies are copied, **no** source locations are
+invented, and nothing is evaluated. A reference or completion in a context that
+`:use`s `COMMON-LISP` (or an explicit `cl:` prefix) can therefore be classified
+and completed statically: `(mapcar …)` and `(format …)` are known functions,
+`(when …)` a known macro, while `if`/`let` remain special operators from the
+central language knowledge. Resolution is Lisp-2-gated (function-ish kinds only
+answer function positions; constants/variables only value positions) and
+conservative — type specifiers are not resolved from value positions, to avoid
+misclassifying ordinary variables named like a type. Builtin targets carry no
+location, so Go-to-Definition never navigates to a fake file; they surface
+through semantic tokens (tagged `defaultLibrary`), hover and completion.
 
 ## LSP features
 
-Implemented in M1 (`server/src/lsp`): `textDocument/documentSymbol`,
-`workspace/symbol`, `textDocument/definition`, `textDocument/hover`, plus
-`workspace/didChangeWatchedFiles` and init-time workspace scanning. Definition
-and hover classify the reference position into a function / value / data context
-(see *Lisp-2 namespaces and reference contexts*) and resolve in the matching
-namespace; data positions resolve to nothing. Semantic requests await the
-initialization readiness barrier so results are deterministic. The server speaks
-LSP over stdio and has no VS Code dependency; `createServer` returns a handle
-exposing `whenReady`, which also lets tests drive the server behind a clean,
-in-process transport boundary (`server/test/lsp-integration.test.ts`) without
-leaving open handles.
+Implemented through M2 (`server/src/lsp`): `textDocument/documentSymbol`,
+`workspace/symbol`, `textDocument/definition`, `textDocument/references`,
+`textDocument/hover`, `textDocument/semanticTokens`, `textDocument/completion`,
+`textDocument/signatureHelp` and `textDocument/publishDiagnostics`, plus
+`workspace/didChangeWatchedFiles` and init-time workspace scanning. Each
+capability is advertised during `initialize` and has at least one real LSP
+integration test driving the server boundary (`server/test/lsp-*.test.ts`).
+
+All of these features consume **one** semantic resolution model: the LSP
+handlers are thin adapters over `WorkspaceIndex` — `resolveAt`, `findReferences`,
+`semanticTokens`, `completions`, `signatureHelp` and `diagnostics` — and the
+internal `CompletionCandidate` / `SignatureModel` / diagnostic shapes are mapped
+to LSP types in `server/src/lsp/conversions.ts`. The handlers never re-derive
+resolution, re-parse lambda lists or re-run completion logic of their own, so
+Definition, References, Hover, Semantic Tokens, Completion, Signature Help and
+Diagnostics all agree on symbol identity.
+
+- **Completion** classifies the cursor position (function vs value, package
+  prefix) and returns lexical, workspace-global and standard-library candidates
+  with deterministic ranking. It emits a `TextEdit` replacement range so
+  `pay:aut|` replaces only `aut` and preserves the `pay:` (or `pay::`) qualifier
+  instead of destroying it. Comments, strings and quoted data yield no semantic
+  completion.
+- **Signature Help** maps the callable's captured lambda list to
+  `SignatureInformation`/`ParameterInformation`; the active parameter is computed
+  from source structure (counting completed argument forms), so a nested form in
+  an earlier argument does not shift it. Trigger characters are conservative and
+  manual invocation always works.
+- **Diagnostics** are published when an open document is first indexed, when it
+  changes, and when package information in another workspace file changes (so
+  editing a `defpackage`'s `:export` list refreshes dependent open files).
+  Diagnostics are cleared when the issue is resolved or the document closes;
+  stale diagnostics are never left behind. Only statically provable problems are
+  reported (unknown explicit package, non-exported external access, ambiguous
+  inherited symbol, clearly invalid duplicate binding) — an unresolved function
+  or variable is never diagnosed, because Common Lisp legitimately establishes
+  names at load or run time.
+
+Definition and hover classify the reference position into a function / value /
+data context (see *Lisp-2 namespaces and reference contexts*) and resolve in the
+matching namespace; data positions resolve to nothing. Semantic requests await
+the initialization readiness barrier so results are deterministic. The server
+speaks LSP over stdio and has no VS Code dependency; `createServer` returns a
+handle exposing `whenReady`, which also lets tests drive the server behind a
+clean, in-process transport boundary (`server/test/lsp-integration.test.ts` and
+`server/test/lsp-features.test.ts`) without leaving open handles.
 
 File URI/path conversion (`server/src/lsp/workspace-fs.ts`) uses Node's standard
 `fileURLToPath` / `pathToFileURL` helpers rather than a hand-rolled converter, so
